@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "rax.h"
 
 /* OpenAI/Anthropic compatible local server.
  *
@@ -4112,20 +4113,39 @@ typedef enum {
     TOOL_MEMORY_DISK = 1,
 } tool_memory_source;
 
+typedef struct tool_memory_entry tool_memory_entry;
+
 typedef struct {
-    char *id;
     char *dsml;
+    size_t len;
+    size_t bytes;
+    int refs;
+    uint64_t seen;
+    tool_memory_entry *entries;
+} tool_memory_block;
+
+struct tool_memory_entry {
+    char *id;
+    tool_memory_block *block;
     size_t bytes;
     uint64_t stamp;
     tool_memory_source source;
-} tool_memory_entry;
+    tool_memory_entry *prev;
+    tool_memory_entry *next;
+    tool_memory_entry *block_next;
+};
 
 typedef struct {
-    tool_memory_entry *entry;
-    int len;
-    int cap;
+    rax *by_id;
+    rax *by_block;
+    tool_memory_entry *head;
+    tool_memory_entry *tail;
+    int entries;
+    int max_entries;
     size_t bytes;
+    size_t max_bytes;
     uint64_t clock;
+    uint64_t scan_clock;
 } tool_memory;
 
 struct server {
@@ -4175,103 +4195,197 @@ struct job {
  * state.
  */
 
-#define DS4_TOOL_MEMORY_MAX_ENTRIES 1024
-#define DS4_TOOL_MEMORY_MAX_BYTES (64u * 1024u * 1024u)
+#define DS4_TOOL_MEMORY_DEFAULT_MAX_IDS 100000
+#define DS4_TOOL_MEMORY_MAX_BYTES (512u * 1024u * 1024u)
 
-static void tool_memory_entry_free(tool_memory_entry *e) {
-    free(e->id);
-    free(e->dsml);
-    memset(e, 0, sizeof(*e));
+static int tool_memory_max_entries(const tool_memory *m) {
+    return m && m->max_entries > 0 ? m->max_entries : DS4_TOOL_MEMORY_DEFAULT_MAX_IDS;
 }
 
-static void tool_memory_free(tool_memory *m) {
-    for (int i = 0; i < m->len; i++) tool_memory_entry_free(&m->entry[i]);
-    free(m->entry);
-    memset(m, 0, sizeof(*m));
+static size_t tool_memory_max_bytes(const tool_memory *m) {
+    return m && m->max_bytes > 0 ? m->max_bytes : DS4_TOOL_MEMORY_MAX_BYTES;
 }
 
-static int tool_memory_find_locked(const tool_memory *m, const char *id) {
-    if (!id || !id[0]) return -1;
-    for (int i = 0; i < m->len; i++) {
-        if (m->entry[i].id && !strcmp(m->entry[i].id, id)) return i;
+static void tool_memory_init_locked(tool_memory *m) {
+    if (m->by_id && m->by_block) return;
+    m->by_id = raxNew();
+    m->by_block = raxNew();
+    if (!m->by_id || !m->by_block) die("out of memory");
+}
+
+static void tool_memory_link_head(tool_memory *m, tool_memory_entry *e) {
+    e->prev = NULL;
+    e->next = m->head;
+    if (m->head) m->head->prev = e;
+    else m->tail = e;
+    m->head = e;
+}
+
+static void tool_memory_unlink(tool_memory *m, tool_memory_entry *e) {
+    if (e->prev) e->prev->next = e->next;
+    else m->head = e->next;
+    if (e->next) e->next->prev = e->prev;
+    else m->tail = e->prev;
+    e->prev = e->next = NULL;
+}
+
+static void tool_memory_touch(tool_memory *m, tool_memory_entry *e) {
+    e->stamp = ++m->clock;
+    if (m->head == e) return;
+    tool_memory_unlink(m, e);
+    tool_memory_link_head(m, e);
+}
+
+static void tool_block_unlink_entry(tool_memory_block *b, tool_memory_entry *e) {
+    tool_memory_entry **p = &b->entries;
+    while (*p) {
+        if (*p == e) {
+            *p = e->block_next;
+            e->block_next = NULL;
+            return;
+        }
+        p = &(*p)->block_next;
     }
-    return -1;
 }
 
-static void tool_memory_remove_locked(tool_memory *m, int idx) {
-    if (idx < 0 || idx >= m->len) return;
-    if (m->bytes >= m->entry[idx].bytes) m->bytes -= m->entry[idx].bytes;
+static tool_memory_block *tool_memory_find_block_locked(tool_memory *m,
+                                                        const char *dsml,
+                                                        size_t len) {
+    if (!m->by_block || !dsml || len == 0) return NULL;
+    void *v = raxFind(m->by_block, (unsigned char *)dsml, len);
+    return v == raxNotFound ? NULL : v;
+}
+
+static tool_memory_block *tool_memory_get_block_locked(tool_memory *m,
+                                                       const char *dsml,
+                                                       size_t len) {
+    tool_memory_block *b = tool_memory_find_block_locked(m, dsml, len);
+    if (b) return b;
+
+    b = xmalloc(sizeof(*b));
+    memset(b, 0, sizeof(*b));
+    b->dsml = xstrndup(dsml, len);
+    b->len = len;
+    b->bytes = len + 1 + sizeof(*b);
+    if (!raxInsert(m->by_block, (unsigned char *)b->dsml, b->len, b, NULL)) {
+        free(b->dsml);
+        free(b);
+        die("out of memory");
+    }
+    m->bytes += b->bytes;
+    return b;
+}
+
+static void tool_memory_release_block_locked(tool_memory *m, tool_memory_block *b) {
+    if (!b) return;
+    if (--b->refs > 0) return;
+    if (m->by_block) {
+        void *old = NULL;
+        (void)raxRemove(m->by_block, (unsigned char *)b->dsml, b->len, &old);
+    }
+    if (m->bytes >= b->bytes) m->bytes -= b->bytes;
     else m->bytes = 0;
-    tool_memory_entry_free(&m->entry[idx]);
-    if (idx + 1 < m->len) {
-        memmove(&m->entry[idx], &m->entry[idx + 1],
-                (size_t)(m->len - idx - 1) * sizeof(m->entry[0]));
+    free(b->dsml);
+    free(b);
+}
+
+static void tool_memory_remove_entry_locked(tool_memory *m, tool_memory_entry *e) {
+    if (!e) return;
+    if (m->by_id && e->id) {
+        void *old = NULL;
+        (void)raxRemove(m->by_id, (unsigned char *)e->id, strlen(e->id), &old);
     }
-    m->len--;
+    tool_memory_unlink(m, e);
+    if (e->block) tool_block_unlink_entry(e->block, e);
+    if (m->bytes >= e->bytes) m->bytes -= e->bytes;
+    else m->bytes = 0;
+    if (m->entries > 0) m->entries--;
+    free(e->id);
+    tool_memory_release_block_locked(m, e->block);
+    free(e);
 }
 
 static void tool_memory_prune_locked(tool_memory *m) {
-    while (m->len > DS4_TOOL_MEMORY_MAX_ENTRIES ||
-           m->bytes > DS4_TOOL_MEMORY_MAX_BYTES)
+    while ((m->entries > tool_memory_max_entries(m) ||
+            m->bytes > tool_memory_max_bytes(m)) && m->tail)
     {
-        int oldest = 0;
-        for (int i = 1; i < m->len; i++) {
-            if (m->entry[i].stamp < m->entry[oldest].stamp) oldest = i;
-        }
-        tool_memory_remove_locked(m, oldest);
+        tool_memory_remove_entry_locked(m, m->tail);
     }
+}
+
+static tool_memory_entry *tool_memory_find_entry_locked(tool_memory *m,
+                                                        const char *id) {
+    if (!m->by_id || !id || !id[0]) return NULL;
+    void *v = raxFind(m->by_id, (unsigned char *)id, strlen(id));
+    return v == raxNotFound ? NULL : v;
 }
 
 static void tool_memory_put_locked(tool_memory *m, const char *id,
                                    const char *dsml, tool_memory_source source) {
     if (!id || !id[0] || !dsml || !dsml[0]) return;
-    size_t bytes = strlen(id) + strlen(dsml) + 2;
-    int idx = tool_memory_find_locked(m, id);
-    if (idx >= 0) {
-        tool_memory_source old_source = m->entry[idx].source;
-        if (m->bytes >= m->entry[idx].bytes) m->bytes -= m->entry[idx].bytes;
-        else m->bytes = 0;
-        free(m->entry[idx].dsml);
-        m->entry[idx].dsml = xstrdup(dsml);
-        m->entry[idx].bytes = bytes;
-        m->entry[idx].stamp = ++m->clock;
-        m->entry[idx].source =
-            old_source == TOOL_MEMORY_RAM || source == TOOL_MEMORY_RAM ?
-                TOOL_MEMORY_RAM : TOOL_MEMORY_DISK;
-        m->bytes += bytes;
+    tool_memory_init_locked(m);
+
+    size_t dsml_len = strlen(dsml);
+    tool_memory_entry *old = tool_memory_find_entry_locked(m, id);
+    if (old && old->block && old->block->len == dsml_len &&
+        !memcmp(old->block->dsml, dsml, dsml_len))
+    {
+        if (source == TOOL_MEMORY_RAM) old->source = TOOL_MEMORY_RAM;
+        tool_memory_touch(m, old);
         tool_memory_prune_locked(m);
         return;
     }
-    if (m->len == m->cap) {
-        m->cap = m->cap ? m->cap * 2 : 32;
-        m->entry = xrealloc(m->entry, (size_t)m->cap * sizeof(m->entry[0]));
+    if (old) tool_memory_remove_entry_locked(m, old);
+
+    tool_memory_block *b = tool_memory_get_block_locked(m, dsml, dsml_len);
+    tool_memory_entry *e = xmalloc(sizeof(*e));
+    memset(e, 0, sizeof(*e));
+    e->id = xstrdup(id);
+    e->block = b;
+    e->bytes = strlen(id) + 1 + sizeof(*e);
+    e->stamp = ++m->clock;
+    e->source = source;
+    e->block_next = b->entries;
+    b->entries = e;
+    b->refs++;
+
+    if (!raxInsert(m->by_id, (unsigned char *)e->id, strlen(e->id), e, NULL)) {
+        tool_block_unlink_entry(b, e);
+        free(e->id);
+        free(e);
+        tool_memory_release_block_locked(m, b);
+        die("out of memory");
     }
-    m->entry[m->len++] = (tool_memory_entry){
-        .id = xstrdup(id),
-        .dsml = xstrdup(dsml),
-        .bytes = bytes,
-        .stamp = ++m->clock,
-        .source = source,
-    };
-    m->bytes += bytes;
+    tool_memory_link_head(m, e);
+    m->entries++;
+    m->bytes += e->bytes;
     tool_memory_prune_locked(m);
+}
+
+static void tool_memory_free(tool_memory *m) {
+    while (m->tail) tool_memory_remove_entry_locked(m, m->tail);
+    if (m->by_id) raxFree(m->by_id);
+    if (m->by_block) raxFree(m->by_block);
+    memset(m, 0, sizeof(*m));
 }
 
 static bool tool_memory_has_id(server *s, const char *id) {
     if (!s || s->disable_exact_dsml_tool_replay || !id || !id[0]) return false;
     pthread_mutex_lock(&s->tool_mu);
-    bool found = tool_memory_find_locked(&s->tool_mem, id) >= 0;
+    bool found = tool_memory_find_entry_locked(&s->tool_mem, id) != NULL;
     pthread_mutex_unlock(&s->tool_mu);
     return found;
 }
 
 static const char *tool_memory_lookup_locked(tool_memory *m, const char *id,
-                                             tool_memory_source *source) {
-    int idx = tool_memory_find_locked(m, id);
-    if (idx < 0) return NULL;
-    m->entry[idx].stamp = ++m->clock;
-    if (source) *source = m->entry[idx].source;
-    return m->entry[idx].dsml;
+                                             tool_memory_source *source,
+                                             tool_memory_block **block) {
+    tool_memory_entry *e = tool_memory_find_entry_locked(m, id);
+    if (!e || !e->block) return NULL;
+    tool_memory_touch(m, e);
+    if (source) *source = e->source;
+    if (block) *block = e->block;
+    return e->block->dsml;
 }
 
 static void tool_memory_remember(server *s, const tool_calls *calls) {
@@ -4300,18 +4414,6 @@ static void tool_memory_put(server *s, const char *id, const char *dsml) {
 }
 #endif
 
-static int tool_memory_count_dsml_in_text(server *s, const char *text) {
-    if (!s || s->disable_exact_dsml_tool_replay || !text || !text[0]) return 0;
-    int count = 0;
-    pthread_mutex_lock(&s->tool_mu);
-    for (int i = 0; i < s->tool_mem.len; i++) {
-        tool_memory_entry *e = &s->tool_mem.entry[i];
-        if (e->dsml && strstr(text, e->dsml)) count++;
-    }
-    pthread_mutex_unlock(&s->tool_mu);
-    return count;
-}
-
 static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
                                            tool_replay_stats *stats) {
     if (!msgs) return;
@@ -4330,29 +4432,31 @@ static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
     for (int i = 0; i < msgs->len; i++) {
         tool_calls *calls = &msgs->v[i].calls;
         if (calls->len == 0 || calls->raw_dsml) continue;
-        const char *matched = NULL;
+        tool_memory_block *matched = NULL;
         tool_memory_source matched_source = TOOL_MEMORY_DISK;
         bool exact = true;
         int missing = 0;
         for (int j = 0; j < calls->len; j++) {
             tool_memory_source source = TOOL_MEMORY_DISK;
+            tool_memory_block *block = NULL;
             const char *dsml =
-                tool_memory_lookup_locked(&s->tool_mem, calls->v[j].id, &source);
+                tool_memory_lookup_locked(&s->tool_mem, calls->v[j].id,
+                                          &source, &block);
             if (!dsml) {
                 exact = false;
                 missing++;
                 continue;
             }
             if (!matched) {
-                matched = dsml;
+                matched = block;
                 matched_source = source;
-            } else if (strcmp(matched, dsml)) {
+            } else if (matched != block) {
                 exact = false;
             }
             if (source == TOOL_MEMORY_RAM) matched_source = TOOL_MEMORY_RAM;
         }
         if (exact && matched) {
-            calls->raw_dsml = xstrdup(matched);
+            calls->raw_dsml = xstrdup(matched->dsml);
             if (stats) {
                 if (matched_source == TOOL_MEMORY_RAM) stats->mem++;
                 else stats->disk++;
@@ -4717,6 +4821,51 @@ static void kv_cache_push(kv_disk_cache *kc, kv_entry e) {
     kc->entry[kc->len++] = e;
 }
 
+static const char *find_next_dsml_tool_block(const char *p, const char **end_out) {
+    struct block_form {
+        const char *start;
+        const char *end;
+    } forms[] = {
+        {"\n\n" DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END},
+        {DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END},
+        {"\n\n" DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT},
+        {DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT},
+        {"\n\n<tool_calls>", "</tool_calls>"},
+        {"<tool_calls>", "</tool_calls>"},
+    };
+
+    const char *best = NULL;
+    const char *best_end = NULL;
+    for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); i++) {
+        const char *s = strstr(p, forms[i].start);
+        if (!s || (best && s >= best)) continue;
+        const char *e = strstr(s, forms[i].end);
+        if (!e) continue;
+        best = s;
+        best_end = e + strlen(forms[i].end);
+    }
+    if (end_out) *end_out = best_end;
+    return best;
+}
+
+static int tool_memory_count_dsml_in_text(server *s, const char *text) {
+    if (!s || s->disable_exact_dsml_tool_replay || !text || !text[0]) return 0;
+    int count = 0;
+    pthread_mutex_lock(&s->tool_mu);
+    const char *p = text;
+    for (;;) {
+        const char *end = NULL;
+        const char *start = find_next_dsml_tool_block(p, &end);
+        if (!start || !end) break;
+        tool_memory_block *b =
+            tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
+        if (b) count += b->refs;
+        p = end;
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    return count;
+}
+
 static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
                               uint64_t *written_bytes) {
     if (written_bytes) *written_bytes = 0;
@@ -4725,14 +4874,25 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
     pthread_mutex_lock(&s->tool_mu);
     uint32_t count = 0;
     uint64_t bytes = KV_TOOL_MAP_HEADER;
-    for (int i = 0; i < s->tool_mem.len; i++) {
-        tool_memory_entry *e = &s->tool_mem.entry[i];
-        if (!e->id || !e->dsml || !strstr(text, e->dsml)) continue;
-        size_t id_len = strlen(e->id);
-        size_t dsml_len = strlen(e->dsml);
-        if (id_len > UINT32_MAX || dsml_len > UINT32_MAX) continue;
-        count++;
-        bytes += 8u + (uint64_t)id_len + (uint64_t)dsml_len;
+    uint64_t scan = ++s->tool_mem.scan_clock;
+    const char *p = text;
+    for (;;) {
+        const char *end = NULL;
+        const char *start = find_next_dsml_tool_block(p, &end);
+        if (!start || !end) break;
+        tool_memory_block *b =
+            tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
+        if (b && b->seen != scan) {
+            b->seen = scan;
+            for (tool_memory_entry *e = b->entries; e; e = e->block_next) {
+                size_t id_len = strlen(e->id);
+                size_t dsml_len = b->len;
+                if (id_len > UINT32_MAX || dsml_len > UINT32_MAX) continue;
+                count++;
+                bytes += 8u + (uint64_t)id_len + (uint64_t)dsml_len;
+            }
+        }
+        p = end;
     }
     if (count == 0) {
         pthread_mutex_unlock(&s->tool_mu);
@@ -4747,18 +4907,29 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
     le_put32(h + 4, count);
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h);
 
-    for (int i = 0; ok && i < s->tool_mem.len; i++) {
-        tool_memory_entry *e = &s->tool_mem.entry[i];
-        if (!e->id || !e->dsml || !strstr(text, e->dsml)) continue;
-        size_t id_len = strlen(e->id);
-        size_t dsml_len = strlen(e->dsml);
-        if (id_len > UINT32_MAX || dsml_len > UINT32_MAX) continue;
-        uint8_t lens[8];
-        le_put32(lens, (uint32_t)id_len);
-        le_put32(lens + 4, (uint32_t)dsml_len);
-        ok = fwrite(lens, 1, sizeof(lens), fp) == sizeof(lens) &&
-             fwrite(e->id, 1, id_len, fp) == id_len &&
-             fwrite(e->dsml, 1, dsml_len, fp) == dsml_len;
+    scan = ++s->tool_mem.scan_clock;
+    p = text;
+    for (;;) {
+        const char *end = NULL;
+        const char *start = find_next_dsml_tool_block(p, &end);
+        if (!start || !end || !ok) break;
+        tool_memory_block *b =
+            tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
+        if (b && b->seen != scan) {
+            b->seen = scan;
+            for (tool_memory_entry *e = b->entries; ok && e; e = e->block_next) {
+                size_t id_len = strlen(e->id);
+                size_t dsml_len = b->len;
+                if (id_len > UINT32_MAX || dsml_len > UINT32_MAX) continue;
+                uint8_t lens[8];
+                le_put32(lens, (uint32_t)id_len);
+                le_put32(lens + 4, (uint32_t)dsml_len);
+                ok = fwrite(lens, 1, sizeof(lens), fp) == sizeof(lens) &&
+                     fwrite(e->id, 1, id_len, fp) == id_len &&
+                     fwrite(b->dsml, 1, dsml_len, fp) == dsml_len;
+            }
+        }
+        p = end;
     }
     pthread_mutex_unlock(&s->tool_mu);
 
@@ -4776,7 +4947,7 @@ static int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wante
         h[2] != KV_TOOL_MAP_MAGIC2 || h[3] != KV_TOOL_MAP_VERSION) return 0;
 
     uint32_t count = le_get32(h + 4);
-    if (count > DS4_TOOL_MEMORY_MAX_ENTRIES * 4u) return 0;
+    if ((uint64_t)count > (uint64_t)tool_memory_max_entries(&s->tool_mem) * 4u) return 0;
     int loaded = 0;
     for (uint32_t i = 0; i < count; i++) {
         uint8_t lens[8];
@@ -6749,6 +6920,7 @@ typedef struct {
     kv_cache_options kv_cache;
     bool kv_cache_reject_different_quant;
     bool disable_exact_dsml_tool_replay;
+    int tool_memory_max_ids;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -6877,6 +7049,8 @@ static void usage(FILE *fp) {
         "      Refuse checkpoints written by the same model with a different routed-expert quantization.\n"
         "  --disable-exact-dsml-tool-replay\n"
         "      Disable the tool-id -> exact sampled DSML map. Tool history falls back to canonical JSON rendering.\n"
+        "  --tool-memory-max-ids N\n"
+        "      Maximum exact tool-call IDs kept in RAM for replay. Default: 100000\n"
         "\n"
         "  Cache triggers:\n"
         "      cold       save a stable prefix of a long first prompt before generation starts\n"
@@ -6908,6 +7082,7 @@ static server_config parse_options(int argc, char **argv) {
         .port = 8000,
         .ctx_size = 32768,
         .default_tokens = 393216,
+        .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
     };
     c.kv_cache = kv_cache_default_options();
 
@@ -6954,6 +7129,8 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache_reject_different_quant = true;
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
             c.disable_exact_dsml_tool_replay = true;
+        } else if (!strcmp(arg, "--tool-memory-max-ids")) {
+            c.tool_memory_max_ids = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--warm-weights")) {
@@ -7007,6 +7184,7 @@ int main(int argc, char **argv) {
     s.session = session;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
+    s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
@@ -8178,6 +8356,36 @@ static void test_exact_dsml_tool_replay_can_be_disabled(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+static void test_tool_memory_max_ids_prunes_oldest(void) {
+    const char *a_dsml = "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">\n<｜DSML｜parameter name=\"command\" string=\"true\">a</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+    const char *b_dsml = "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">\n<｜DSML｜parameter name=\"command\" string=\"true\">b</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+    const char *c_dsml = "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">\n<｜DSML｜parameter name=\"command\" string=\"true\">c</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    s.tool_mem.max_entries = 2;
+    tool_memory_put(&s, "call_a", a_dsml);
+    tool_memory_put(&s, "call_b", b_dsml);
+    tool_memory_put(&s, "call_c", c_dsml);
+
+    chat_msgs msgs = {0};
+    chat_msg a = {0};
+    a.role = xstrdup("assistant");
+    tool_call tc = {.id = xstrdup("call_a"), .name = xstrdup("bash"), .arguments = xstrdup("{}")};
+    tool_calls_push(&a.calls, tc);
+    chat_msgs_push(&msgs, a);
+
+    tool_replay_stats stats = {0};
+    tool_memory_attach_to_messages(&s, &msgs, &stats);
+    TEST_ASSERT(msgs.v[0].calls.raw_dsml == NULL);
+    TEST_ASSERT(stats.canonical == 1);
+    TEST_ASSERT(stats.missing_ids == 1);
+
+    chat_msgs_free(&msgs);
+    tool_memory_free(&s.tool_mem);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
 static void test_tool_separator_whitespace_is_not_content(void) {
     const char *generated =
         "<think>need a tool</think>"
@@ -8639,6 +8847,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
     test_exact_dsml_tool_replay_can_be_disabled();
+    test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();
     test_tool_separator_whitespace_is_not_content();
