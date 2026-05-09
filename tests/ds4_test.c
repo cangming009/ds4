@@ -500,7 +500,7 @@ static void test_tool_call_quality_one(bool quality) {
 
     request r;
     char err[160];
-    TEST_ASSERT(parse_chat_request(engine, test_tool_call_request_json(),
+    TEST_ASSERT(parse_chat_request(engine, NULL, test_tool_call_request_json(),
                                    512, 32768, &r, err, sizeof(err)));
 
     ds4_session *session = NULL;

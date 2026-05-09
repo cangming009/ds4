@@ -364,6 +364,11 @@ The file is intentionally written with ordinary `read`/`write` I/O, not
 `mmap`, so restoring cache entries does not add more VM mappings to a process
 that already maps the model.
 
+Tool calls also keep a small exact-DSML replay map keyed by unguessable tool
+IDs, so client JSON history can be rendered back to the exact sampled text. Use
+`--disable-exact-dsml-tool-replay` to disable this and fall back to canonical
+JSON-to-DSML rendering.
+
 On disk, a cache file is:
 
 ```text
@@ -371,6 +376,7 @@ KVC fixed header, 48 bytes
 u32 rendered_text_bytes
 rendered_text_bytes of UTF-8-ish token text
 DS4 session payload, payload_bytes from the KVC header
+optional tool-id map section
 ```
 
 The fixed header is little-endian:
@@ -380,7 +386,8 @@ The fixed header is little-endian:
 3   u8     version = 1
 4   u8     routed expert quant bits, currently 2 or 4
 5   u8     save reason: 0 unknown, 1 cold, 2 continued, 3 evict, 4 shutdown
-6   u8[2]  reserved
+6   u8     extension flags, bit 0 = appended tool-id map
+7   u8     reserved
 8   u32    cached token count
 12  u32    hit count
 16  u32    context size the snapshot was written for
@@ -395,6 +402,14 @@ It is stored only for observability, so humans can inspect a cache directory
 without decoding token IDs. It is not used as the key and it is not trusted
 when loading; after load, the stored checkpoint tokens must still match the
 incoming request prefix.
+
+The optional tool-id map is present only when header extension bit 0 is set.
+Appended sections use fixed bit order, so future extension bits can add fields
+without ambiguity. The map stores unguessable API tool call IDs back to the
+exact DSML block the model sampled. Only mappings whose DSML block is present
+in the rendered cached text are stored. This lets restarted servers render
+later client history byte-for-byte like the original model output, even if the
+client reorders JSON arguments.
 
 The DS4 session payload starts with thirteen little-endian `u32` fields:
 

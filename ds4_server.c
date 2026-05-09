@@ -80,6 +80,24 @@ static char *xstrdup(const char *s) {
     return p;
 }
 
+static bool random_bytes(void *dst, size_t len) {
+    unsigned char *p = dst;
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return false;
+    while (len) {
+        ssize_t n = read(fd, p, len);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            close(fd);
+            return false;
+        }
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    close(fd);
+    return true;
+}
+
 static char *xstrndup(const char *s, size_t n) {
     char *p = xmalloc(n + 1);
     memcpy(p, s, n);
@@ -446,6 +464,30 @@ typedef enum {
     API_ANTHROPIC,
 } api_style;
 
+static void random_tool_id(char *dst, size_t dstlen, api_style api) {
+    static uint64_t fallback_ctr;
+    unsigned char bytes[16];
+    const char *prefix = api == API_ANTHROPIC ? "toolu_" : "call_";
+    size_t pos = snprintf(dst, dstlen, "%s", prefix);
+    if (pos >= dstlen) return;
+
+    if (!random_bytes(bytes, sizeof(bytes))) {
+        uint64_t a = ((uint64_t)time(NULL) << 32) ^ (uint64_t)getpid();
+        uint64_t b = ++fallback_ctr ^ (uint64_t)(uintptr_t)dst;
+        memcpy(bytes, &a, sizeof(a));
+        memcpy(bytes + sizeof(a), &b, sizeof(b));
+    }
+
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(bytes) && pos + 2 < dstlen; i++) {
+        dst[pos++] = hex[bytes[i] >> 4];
+        dst[pos++] = hex[bytes[i] & 15];
+    }
+    dst[pos] = '\0';
+}
+
+typedef struct server server;
+
 typedef struct {
     char *id;
     char *name;
@@ -456,7 +498,15 @@ typedef struct {
     tool_call *v;
     int len;
     int cap;
+    char *raw_dsml;
 } tool_calls;
+
+typedef struct {
+    int mem;
+    int disk;
+    int canonical;
+    int missing_ids;
+} tool_replay_stats;
 
 typedef struct {
     char *name;
@@ -485,6 +535,11 @@ typedef struct {
     int cap;
 } chat_msgs;
 
+static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
+                                           tool_replay_stats *stats);
+static bool tool_memory_has_id(server *s, const char *id);
+static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs);
+
 typedef struct {
     char **v;
     int len;
@@ -511,6 +566,7 @@ typedef struct {
     bool stream_include_usage;
     ds4_think_mode think_mode;
     bool has_tools;
+    tool_replay_stats tool_replay;
 } request;
 
 static void tool_call_free(tool_call *tc) {
@@ -522,6 +578,7 @@ static void tool_call_free(tool_call *tc) {
 
 static void tool_calls_free(tool_calls *calls) {
     for (int i = 0; i < calls->len; i++) tool_call_free(&calls->v[i]);
+    free(calls->raw_dsml);
     free(calls->v);
     memset(calls, 0, sizeof(*calls));
 }
@@ -586,11 +643,6 @@ static int tool_schema_orders_find_index(const tool_schema_orders *orders, const
     return -1;
 }
 
-static const tool_schema_order *tool_schema_orders_find(const tool_schema_orders *orders, const char *name) {
-    int idx = tool_schema_orders_find_index(orders, name);
-    return idx >= 0 ? &orders->v[idx] : NULL;
-}
-
 static void tool_schema_orders_push(tool_schema_orders *orders, tool_schema_order order) {
     int idx = tool_schema_orders_find_index(orders, order.name);
     if (idx >= 0) {
@@ -604,6 +656,13 @@ static void tool_schema_orders_push(tool_schema_orders *orders, tool_schema_orde
     }
     orders->v[orders->len++] = order;
 }
+
+#ifdef DS4_SERVER_TEST
+static const tool_schema_order *tool_schema_orders_find(const tool_schema_orders *orders, const char *name) {
+    int idx = tool_schema_orders_find_index(orders, name);
+    return idx >= 0 ? &orders->v[idx] : NULL;
+}
+#endif
 
 static void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
@@ -1585,14 +1644,16 @@ static void append_tools_prompt_text(buf *b, const char *tool_schemas) {
         "...\n"
         "</｜DSML｜invoke>\n"
         "</｜DSML｜tool_calls>\n\n"
-        "String parameters should be specified as is and set `string=\"true\"`. "
+        "String parameters should be specified as raw text and set `string=\"true\"`. "
+        "Preserve characters such as `>`, `&`, and `&&` exactly; never replace normal string characters with XML or HTML entity escapes. "
+        "Only if a string value itself contains the exact closing parameter tag `</｜DSML｜parameter>`, write that tag as `&lt;/｜DSML｜parameter>` inside the value. "
         "For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
         "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n"
         "Otherwise, output directly after </think> with tool calls or final response.\n\n"
         "### Available Tool Schemas\n\n");
     buf_puts(b, tool_schemas);
     buf_puts(b, "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls. "
-                "Emit parameters in the same order as each tool's input_schema.properties or parameters.properties object.");
+                "Use the exact parameter names from the schemas.");
 }
 
 static void json_escape(buf *b, const char *s);
@@ -1699,12 +1760,29 @@ static void append_dsml_text_escaped(buf *b, const char *s) {
     }
 }
 
-static void append_dsml_json_literal_escaped(buf *b, const char *s) {
-    for (s = s ? s : ""; *s; s++) {
-        if (*s == '<') buf_puts(b, "\\u003c");
-        else if (*s == '>') buf_puts(b, "\\u003e");
-        else if (*s == '&') buf_puts(b, "\\u0026");
-        else buf_putc(b, *s);
+static void append_dsml_parameter_text(buf *b, const char *s) {
+    const char *end = "</｜DSML｜parameter>";
+    const size_t endlen = strlen(end);
+    for (s = s ? s : ""; *s;) {
+        if (!strncmp(s, end, endlen)) {
+            buf_puts(b, "&lt;");
+            s++;
+        } else {
+            buf_putc(b, *s++);
+        }
+    }
+}
+
+static void append_dsml_json_literal(buf *b, const char *s) {
+    const char *end = "</｜DSML｜parameter>";
+    const size_t endlen = strlen(end);
+    for (s = s ? s : ""; *s;) {
+        if (!strncmp(s, end, endlen)) {
+            buf_puts(b, "\\u003c");
+            s++;
+        } else {
+            buf_putc(b, *s++);
+        }
     }
 }
 
@@ -1714,8 +1792,8 @@ static void append_dsml_arg(buf *b, const json_arg *arg) {
     buf_puts(b, "\" string=\"");
     buf_puts(b, arg->is_string ? "true" : "false");
     buf_puts(b, "\">");
-    if (arg->is_string) append_dsml_text_escaped(b, arg->value);
-    else append_dsml_json_literal_escaped(b, arg->value);
+    if (arg->is_string) append_dsml_parameter_text(b, arg->value);
+    else append_dsml_json_literal(b, arg->value);
     buf_puts(b, "</｜DSML｜parameter>\n");
 }
 
@@ -1745,7 +1823,7 @@ static void append_json_arg_pair(buf *b, const json_arg *arg) {
     else buf_puts(b, arg->value);
 }
 
-static void append_json_object_ordered_or_empty(buf *b, const char *json, const tool_schema_order *order) {
+static void append_json_object_or_empty(buf *b, const char *json) {
     json_args args = {0};
     if (!json_args_parse(json, &args)) {
         buf_puts(b, "{}");
@@ -1753,18 +1831,7 @@ static void append_json_object_ordered_or_empty(buf *b, const char *json, const 
     }
     buf_putc(b, '{');
     bool wrote = false;
-    if (order) {
-        for (int i = 0; i < order->len; i++) {
-            int idx = json_args_find_unused(&args, order->prop[i]);
-            if (idx < 0) continue;
-            if (wrote) buf_putc(b, ',');
-            append_json_arg_pair(b, &args.v[idx]);
-            args.v[idx].used = true;
-            wrote = true;
-        }
-    }
     for (int i = 0; i < args.len; i++) {
-        if (args.v[i].used) continue;
         if (wrote) buf_putc(b, ',');
         append_json_arg_pair(b, &args.v[i]);
         wrote = true;
@@ -1773,18 +1840,21 @@ static void append_json_object_ordered_or_empty(buf *b, const char *json, const 
     json_args_free(&args);
 }
 
-static void append_dsml_tool_calls_text(buf *b, const tool_calls *calls, const tool_schema_orders *orders) {
+static void append_dsml_tool_calls_text(buf *b, const tool_calls *calls) {
     if (!calls || calls->len == 0) return;
+    if (calls->raw_dsml && calls->raw_dsml[0]) {
+        buf_puts(b, calls->raw_dsml);
+        return;
+    }
     buf_puts(b, "\n\n<｜DSML｜tool_calls>\n");
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
-        const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
         buf_puts(b, "<｜DSML｜invoke name=\"");
         append_dsml_attr_escaped(b, tc->name);
         buf_puts(b, "\">\n");
-        if (!append_dsml_arguments_from_json(b, tc->arguments, order)) {
+        if (!append_dsml_arguments_from_json(b, tc->arguments, NULL)) {
             buf_puts(b, "<｜DSML｜parameter name=\"arguments\" string=\"true\">");
-            append_dsml_text_escaped(b, tc->arguments);
+            append_dsml_parameter_text(b, tc->arguments);
             buf_puts(b, "</｜DSML｜parameter>\n");
         }
         buf_puts(b, "</｜DSML｜invoke>\n");
@@ -1803,6 +1873,7 @@ static bool role_is_user_like(const char *role) {
 static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                      const tool_schema_orders *tool_orders,
                                      ds4_think_mode think_mode) {
+    (void)tool_orders;
     const bool think = ds4_think_mode_enabled(think_mode);
     bool tool_context = tool_schemas && tool_schemas[0];
     int last_user_idx = -1;
@@ -1867,7 +1938,7 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
                 }
             }
             buf_puts(&out, m->content ? m->content : "");
-            append_dsml_tool_calls_text(&out, &m->calls, tool_orders);
+            append_dsml_tool_calls_text(&out, &m->calls);
             buf_puts(&out, "<｜end▁of▁sentence｜>");
             pending_assistant = false;
             pending_tool_result = false;
@@ -1887,7 +1958,7 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
-static bool parse_chat_request(ds4_engine *e, const char *body, int def_tokens,
+static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     const char *p = body;
@@ -2038,6 +2109,8 @@ static bool parse_chat_request(ds4_engine *e, const char *body, int def_tokens,
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    kv_cache_restore_tool_memory_for_messages(s, &msgs);
+    tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     r->prompt_text = render_chat_prompt_text(&msgs, r->has_tools ? tool_schemas : NULL,
                                              &r->tool_orders, r->think_mode);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
@@ -2052,7 +2125,7 @@ bad:
     return false;
 }
 
-static bool parse_anthropic_request(ds4_engine *e, const char *body, int def_tokens,
+static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                     int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_ANTHROPIC;
@@ -2231,6 +2304,8 @@ static bool parse_anthropic_request(ds4_engine *e, const char *body, int def_tok
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    kv_cache_restore_tool_memory_for_messages(s, &msgs);
+    tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     r->prompt_text = render_chat_prompt_text(&msgs, r->has_tools ? tool_schemas : NULL,
                                              &r->tool_orders, r->think_mode);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
@@ -2668,6 +2743,7 @@ static bool parse_generated_message(const char *text, char **content_out,
     }
 
     size_t content_len = trim_tool_separator_ws(text, 0, (size_t)(start - text));
+    const char *raw_block_start = start;
     const char *tool_calls_start = DS4_TOOL_CALLS_START;
     const char *tool_calls_end = DS4_TOOL_CALLS_END;
     const char *invoke_start = DS4_INVOKE_START;
@@ -2697,6 +2773,9 @@ static bool parse_generated_message(const char *text, char **content_out,
     for (;;) {
         p = skip_ascii_ws(p);
         if (!strncmp(p, tool_calls_end, strlen(tool_calls_end))) {
+            const char *raw_block_end = p + strlen(tool_calls_end);
+            free(calls->raw_dsml);
+            calls->raw_dsml = xstrndup(raw_block_start, (size_t)(raw_block_end - raw_block_start));
             split_reasoning_content(text, content_len, content_out, reasoning_out);
             return true;
         }
@@ -2770,19 +2849,19 @@ static bool parse_generated_message(const char *text, char **content_out,
     }
 }
 
-static void append_ordered_json_string(buf *b, const char *json, const tool_schema_order *order) {
+static void append_json_object_string(buf *b, const char *json) {
     buf tmp = {0};
-    append_json_object_ordered_or_empty(&tmp, json, order);
+    append_json_object_or_empty(&tmp, json);
     json_escape(b, tmp.ptr ? tmp.ptr : "{}");
     buf_free(&tmp);
 }
 
 static void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_prefix,
                                    const tool_schema_orders *orders) {
+    (void)orders;
     buf_putc(b, '[');
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
-        const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
         if (i) buf_putc(b, ',');
         char idbuf[128];
         snprintf(idbuf, sizeof(idbuf), "%s_tool_%d", id_prefix, i);
@@ -2791,7 +2870,7 @@ static void append_tool_calls_json(buf *b, const tool_calls *calls, const char *
         buf_puts(b, ",\"type\":\"function\",\"function\":{\"name\":");
         json_escape(b, tc->name ? tc->name : "");
         buf_puts(b, ",\"arguments\":");
-        append_ordered_json_string(b, tc->arguments, order);
+        append_json_object_string(b, tc->arguments);
         buf_puts(b, "}}");
     }
     buf_putc(b, ']');
@@ -2799,10 +2878,10 @@ static void append_tool_calls_json(buf *b, const tool_calls *calls, const char *
 
 static void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const char *id_prefix,
                                          const tool_schema_orders *orders) {
+    (void)orders;
     buf_putc(b, '[');
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
-        const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
         if (i) buf_putc(b, ',');
         char idbuf[128];
         snprintf(idbuf, sizeof(idbuf), "%s_tool_%d", id_prefix, i);
@@ -2813,7 +2892,7 @@ static void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const 
         buf_puts(b, ",\"type\":\"function\",\"function\":{\"name\":");
         json_escape(b, tc->name ? tc->name : "");
         buf_puts(b, ",\"arguments\":");
-        append_ordered_json_string(b, tc->arguments, order);
+        append_json_object_string(b, tc->arguments);
         buf_puts(b, "}}");
     }
     buf_putc(b, ']');
@@ -2988,6 +3067,8 @@ typedef struct {
     bool args_open;
     bool first_param;
     bool param_is_string;
+    char **ids;
+    int ids_cap;
 } openai_tool_stream;
 
 typedef struct {
@@ -3004,6 +3085,52 @@ static void openai_stream_start(const request *r, openai_stream *st) {
     memset(st, 0, sizeof(*st));
     st->active = true;
     st->mode = ds4_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
+}
+
+static void openai_tool_stream_free(openai_tool_stream *ts) {
+    if (!ts) return;
+    for (int i = 0; i < ts->ids_cap; i++) free(ts->ids[i]);
+    free(ts->ids);
+    ts->ids = NULL;
+    ts->ids_cap = 0;
+}
+
+static void openai_stream_free(openai_stream *st) {
+    if (!st) return;
+    openai_tool_stream_free(&st->tool);
+}
+
+static bool openai_tool_stream_has_id(const openai_tool_stream *ts,
+                                      const char *id, int upto) {
+    if (!ts || !id || !id[0]) return false;
+    if (upto > ts->ids_cap) upto = ts->ids_cap;
+    for (int i = 0; i < upto; i++) {
+        if (ts->ids[i] && !strcmp(ts->ids[i], id)) return true;
+    }
+    return false;
+}
+
+static const char *openai_tool_stream_id(server *s, openai_tool_stream *ts,
+                                         int index) {
+    if (!ts || index < 0) return "";
+    if (index >= ts->ids_cap) {
+        int old = ts->ids_cap;
+        int cap = old ? old : 4;
+        while (cap <= index) cap *= 2;
+        ts->ids = xrealloc(ts->ids, (size_t)cap * sizeof(ts->ids[0]));
+        memset(ts->ids + old, 0, (size_t)(cap - old) * sizeof(ts->ids[0]));
+        ts->ids_cap = cap;
+    }
+    if (!ts->ids[index]) {
+        char id[64];
+        for (;;) {
+            random_tool_id(id, sizeof(id), API_OPENAI);
+            if (!openai_tool_stream_has_id(ts, id, index) &&
+                !tool_memory_has_id(s, id)) break;
+        }
+        ts->ids[index] = xstrdup(id);
+    }
+    return ts->ids[index];
 }
 
 static size_t text_stream_safe_limit(const char *raw, size_t start,
@@ -3033,17 +3160,16 @@ static bool sse_chat_delta_n(int fd, const request *r, const char *id,
  * is complete, then translates each parameter body into argument deltas while
  * holding only tiny tails for partial closing tags, UTF-8, and DSML entities. */
 static bool sse_chat_tool_call_start_delta(int fd, const request *r, const char *id,
-                                           int index, const char *name) {
+                                           int index, const char *tool_id,
+                                           const char *name) {
     buf b = {0};
-    char tool_id[128];
     long now = (long)time(NULL);
-    snprintf(tool_id, sizeof(tool_id), "%s_tool_%d", id, index);
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
     json_escape(&b, r->model);
     buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":");
     buf_printf(&b, "%d", index);
     buf_puts(&b, ",\"id\":");
-    json_escape(&b, tool_id);
+    json_escape(&b, tool_id ? tool_id : "");
     buf_puts(&b, ",\"type\":\"function\",\"function\":{\"name\":");
     json_escape(&b, name ? name : "");
     buf_puts(&b, ",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n");
@@ -3166,6 +3292,7 @@ static bool openai_tool_emit_param_prefix(int fd, const request *r, const char *
 
 static bool openai_tool_stream_init(openai_tool_stream *ts, const char *raw,
                                     size_t raw_len, size_t pos) {
+    openai_tool_stream_free(ts);
     memset(ts, 0, sizeof(*ts));
     ts->active = true;
     ts->state = OPENAI_TOOL_BETWEEN_INVOKES;
@@ -3205,7 +3332,7 @@ static bool openai_tool_stream_fail(openai_tool_stream *ts) {
     return true;
 }
 
-static bool openai_tool_start_invoke(int fd, const request *r, const char *id,
+static bool openai_tool_start_invoke(int fd, server *s, const request *r, const char *id,
                                      openai_tool_stream *ts,
                                      const char *raw, size_t raw_len) {
     const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
@@ -3215,7 +3342,8 @@ static bool openai_tool_start_invoke(int fd, const request *r, const char *id,
     free(tag);
     if (!name) return openai_tool_stream_fail(ts);
 
-    bool ok = sse_chat_tool_call_start_delta(fd, r, id, ts->index, name) &&
+    const char *tool_id = openai_tool_stream_id(s, ts, ts->index);
+    bool ok = sse_chat_tool_call_start_delta(fd, r, id, ts->index, tool_id, name) &&
               openai_tool_emit_args_fragment(fd, r, id, ts, "{", 1);
     free(name);
     if (!ok) return false;
@@ -3272,7 +3400,7 @@ static bool openai_tool_finish_param(int fd, const request *r, const char *id,
     return true;
 }
 
-static bool openai_tool_stream_update(int fd, const request *r, const char *id,
+static bool openai_tool_stream_update(int fd, server *s, const request *r, const char *id,
                                       openai_tool_stream *ts,
                                       const char *raw, size_t raw_len) {
     while (ts->active && ts->parse_pos < raw_len) {
@@ -3289,7 +3417,7 @@ static bool openai_tool_stream_update(int fd, const request *r, const char *id,
             if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->invoke_start)) {
                 size_t before_pos = ts->parse_pos;
                 openai_tool_stream_state before_state = ts->state;
-                if (!openai_tool_start_invoke(fd, r, id, ts, raw, raw_len)) return false;
+                if (!openai_tool_start_invoke(fd, s, r, id, ts, raw, raw_len)) return false;
                 if (ts->parse_pos == before_pos && ts->state == before_state) return true;
                 continue;
             }
@@ -3348,7 +3476,7 @@ static bool openai_tool_stream_update(int fd, const request *r, const char *id,
     return true;
 }
 
-static bool openai_sse_stream_update(int fd, const request *r, const char *id,
+static bool openai_sse_stream_update(int fd, server *s, const request *r, const char *id,
                                      openai_stream *st,
                                      const char *raw, size_t raw_len,
                                      bool final) {
@@ -3424,18 +3552,18 @@ static bool openai_sse_stream_update(int fd, const request *r, const char *id,
     }
 
     if (st->mode == OPENAI_STREAM_TOOL) {
-        if (!openai_tool_stream_update(fd, r, id, &st->tool, raw, raw_len)) return false;
+        if (!openai_tool_stream_update(fd, s, r, id, &st->tool, raw, raw_len)) return false;
         if (!st->tool.active) st->mode = OPENAI_STREAM_SUPPRESS;
     }
     return true;
 }
 
-static bool openai_sse_finish_live(int fd, const request *r, const char *id,
+static bool openai_sse_finish_live(int fd, server *s, const request *r, const char *id,
                                    openai_stream *st, const char *raw,
                                    size_t raw_len, const tool_calls *calls,
                                    const char *finish, int prompt_tokens,
                                    int completion_tokens) {
-    if (!openai_sse_stream_update(fd, r, id, st, raw, raw_len, true)) return false;
+    if (!openai_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
 
     buf b = {0};
     long now = (long)time(NULL);
@@ -3512,7 +3640,7 @@ static const char *anthropic_stop_reason(const char *finish) {
 
 static void append_anthropic_tool_use(buf *b, const tool_call *tc, const char *id_prefix, int i,
                                       const tool_schema_orders *orders) {
-    const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
+    (void)orders;
     char idbuf[128];
     snprintf(idbuf, sizeof(idbuf), "toolu_%s_%d", id_prefix, i);
     buf_puts(b, "{\"type\":\"tool_use\",\"id\":");
@@ -3520,7 +3648,7 @@ static void append_anthropic_tool_use(buf *b, const tool_call *tc, const char *i
     buf_puts(b, ",\"name\":");
     json_escape(b, tc->name ? tc->name : "");
     buf_puts(b, ",\"input\":");
-    append_json_object_ordered_or_empty(b, tc->arguments, order);
+    append_json_object_or_empty(b, tc->arguments);
     buf_putc(b, '}');
 }
 
@@ -3841,12 +3969,12 @@ static bool anthropic_sse_stream_update(int fd, const request *r, const char *id
 static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char *id,
                                            anthropic_stream *st,
                                            const tool_calls *calls) {
+    (void)r;
     if (!calls) return true;
 
     buf b = {0};
     for (int i = 0; i < calls->len; i++, st->next_index++) {
         const tool_call *tc = &calls->v[i];
-        const tool_schema_order *order = tool_schema_orders_find(&r->tool_orders, tc->name);
         char idbuf[128];
         snprintf(idbuf, sizeof(idbuf), "toolu_%s_%d", id, i);
         buf_printf(&b,
@@ -3865,7 +3993,7 @@ static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char 
                    "{\"type\":\"content_block_delta\",\"index\":%d,"
                    "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":",
                    st->next_index);
-        append_ordered_json_string(&b, tc->arguments, order);
+        append_json_object_string(&b, tc->arguments);
         buf_puts(&b, "}}");
         ok = sse_event(fd, "content_block_delta", b.ptr);
         buf_free(&b);
@@ -3951,6 +4079,7 @@ typedef struct {
     uint32_t tokens;
     uint32_t hits;
     uint32_t ctx_size;
+    uint8_t ext_flags;
     uint64_t created_at;
     uint64_t last_used;
     uint64_t payload_bytes;
@@ -3978,11 +4107,35 @@ typedef struct {
     int cap;
 } kv_disk_cache;
 
+typedef enum {
+    TOOL_MEMORY_RAM = 0,
+    TOOL_MEMORY_DISK = 1,
+} tool_memory_source;
+
 typedef struct {
+    char *id;
+    char *dsml;
+    size_t bytes;
+    uint64_t stamp;
+    tool_memory_source source;
+} tool_memory_entry;
+
+typedef struct {
+    tool_memory_entry *entry;
+    int len;
+    int cap;
+    size_t bytes;
+    uint64_t clock;
+} tool_memory;
+
+struct server {
     ds4_engine *engine;
     ds4_session *session;
     int default_tokens;
     kv_disk_cache kv;
+    tool_memory tool_mem;
+    bool disable_exact_dsml_tool_replay;
+    pthread_mutex_t tool_mu;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     pthread_cond_t clients_cv;
@@ -3994,7 +4147,7 @@ typedef struct {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
-} server;
+};
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
  * after the response has been written, so request data and the socket remain
@@ -4007,6 +4160,242 @@ struct job {
     pthread_cond_t cv;
     job *next;
 };
+
+/* =========================================================================
+ * Tool Call Text Memory.
+ * =========================================================================
+ *
+ * The model speaks DSML, while OpenAI and Anthropic clients round-trip tool
+ * calls as JSON.  Re-rendering that JSON is not always the same byte sequence:
+ * clients may preserve, sort, or rebuild object keys differently.  Tool call
+ * ids are the bridge between both worlds.  For every generated tool call we
+ * remember the exact DSML block sampled by the model under a random id.  When
+ * the client later sends the same id back in conversation history, we replay
+ * the sampled DSML verbatim and keep the KV cache aligned with the live model
+ * state.
+ */
+
+#define DS4_TOOL_MEMORY_MAX_ENTRIES 1024
+#define DS4_TOOL_MEMORY_MAX_BYTES (64u * 1024u * 1024u)
+
+static void tool_memory_entry_free(tool_memory_entry *e) {
+    free(e->id);
+    free(e->dsml);
+    memset(e, 0, sizeof(*e));
+}
+
+static void tool_memory_free(tool_memory *m) {
+    for (int i = 0; i < m->len; i++) tool_memory_entry_free(&m->entry[i]);
+    free(m->entry);
+    memset(m, 0, sizeof(*m));
+}
+
+static int tool_memory_find_locked(const tool_memory *m, const char *id) {
+    if (!id || !id[0]) return -1;
+    for (int i = 0; i < m->len; i++) {
+        if (m->entry[i].id && !strcmp(m->entry[i].id, id)) return i;
+    }
+    return -1;
+}
+
+static void tool_memory_remove_locked(tool_memory *m, int idx) {
+    if (idx < 0 || idx >= m->len) return;
+    if (m->bytes >= m->entry[idx].bytes) m->bytes -= m->entry[idx].bytes;
+    else m->bytes = 0;
+    tool_memory_entry_free(&m->entry[idx]);
+    if (idx + 1 < m->len) {
+        memmove(&m->entry[idx], &m->entry[idx + 1],
+                (size_t)(m->len - idx - 1) * sizeof(m->entry[0]));
+    }
+    m->len--;
+}
+
+static void tool_memory_prune_locked(tool_memory *m) {
+    while (m->len > DS4_TOOL_MEMORY_MAX_ENTRIES ||
+           m->bytes > DS4_TOOL_MEMORY_MAX_BYTES)
+    {
+        int oldest = 0;
+        for (int i = 1; i < m->len; i++) {
+            if (m->entry[i].stamp < m->entry[oldest].stamp) oldest = i;
+        }
+        tool_memory_remove_locked(m, oldest);
+    }
+}
+
+static void tool_memory_put_locked(tool_memory *m, const char *id,
+                                   const char *dsml, tool_memory_source source) {
+    if (!id || !id[0] || !dsml || !dsml[0]) return;
+    size_t bytes = strlen(id) + strlen(dsml) + 2;
+    int idx = tool_memory_find_locked(m, id);
+    if (idx >= 0) {
+        tool_memory_source old_source = m->entry[idx].source;
+        if (m->bytes >= m->entry[idx].bytes) m->bytes -= m->entry[idx].bytes;
+        else m->bytes = 0;
+        free(m->entry[idx].dsml);
+        m->entry[idx].dsml = xstrdup(dsml);
+        m->entry[idx].bytes = bytes;
+        m->entry[idx].stamp = ++m->clock;
+        m->entry[idx].source =
+            old_source == TOOL_MEMORY_RAM || source == TOOL_MEMORY_RAM ?
+                TOOL_MEMORY_RAM : TOOL_MEMORY_DISK;
+        m->bytes += bytes;
+        tool_memory_prune_locked(m);
+        return;
+    }
+    if (m->len == m->cap) {
+        m->cap = m->cap ? m->cap * 2 : 32;
+        m->entry = xrealloc(m->entry, (size_t)m->cap * sizeof(m->entry[0]));
+    }
+    m->entry[m->len++] = (tool_memory_entry){
+        .id = xstrdup(id),
+        .dsml = xstrdup(dsml),
+        .bytes = bytes,
+        .stamp = ++m->clock,
+        .source = source,
+    };
+    m->bytes += bytes;
+    tool_memory_prune_locked(m);
+}
+
+static bool tool_memory_has_id(server *s, const char *id) {
+    if (!s || s->disable_exact_dsml_tool_replay || !id || !id[0]) return false;
+    pthread_mutex_lock(&s->tool_mu);
+    bool found = tool_memory_find_locked(&s->tool_mem, id) >= 0;
+    pthread_mutex_unlock(&s->tool_mu);
+    return found;
+}
+
+static const char *tool_memory_lookup_locked(tool_memory *m, const char *id,
+                                             tool_memory_source *source) {
+    int idx = tool_memory_find_locked(m, id);
+    if (idx < 0) return NULL;
+    m->entry[idx].stamp = ++m->clock;
+    if (source) *source = m->entry[idx].source;
+    return m->entry[idx].dsml;
+}
+
+static void tool_memory_remember(server *s, const tool_calls *calls) {
+    if (!s || s->disable_exact_dsml_tool_replay ||
+        !calls || !calls->raw_dsml || !calls->raw_dsml[0]) return;
+    pthread_mutex_lock(&s->tool_mu);
+    for (int i = 0; i < calls->len; i++) {
+        tool_memory_put_locked(&s->tool_mem, calls->v[i].id, calls->raw_dsml,
+                               TOOL_MEMORY_RAM);
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+static void tool_memory_put_source(server *s, const char *id, const char *dsml,
+                                   tool_memory_source source) {
+    if (!s || s->disable_exact_dsml_tool_replay ||
+        !id || !id[0] || !dsml || !dsml[0]) return;
+    pthread_mutex_lock(&s->tool_mu);
+    tool_memory_put_locked(&s->tool_mem, id, dsml, source);
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+#ifdef DS4_SERVER_TEST
+static void tool_memory_put(server *s, const char *id, const char *dsml) {
+    tool_memory_put_source(s, id, dsml, TOOL_MEMORY_RAM);
+}
+#endif
+
+static int tool_memory_count_dsml_in_text(server *s, const char *text) {
+    if (!s || s->disable_exact_dsml_tool_replay || !text || !text[0]) return 0;
+    int count = 0;
+    pthread_mutex_lock(&s->tool_mu);
+    for (int i = 0; i < s->tool_mem.len; i++) {
+        tool_memory_entry *e = &s->tool_mem.entry[i];
+        if (e->dsml && strstr(text, e->dsml)) count++;
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    return count;
+}
+
+static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
+                                           tool_replay_stats *stats) {
+    if (!msgs) return;
+    if (!s || s->disable_exact_dsml_tool_replay) {
+        if (stats) {
+            for (int i = 0; i < msgs->len; i++) {
+                tool_calls *calls = &msgs->v[i].calls;
+                if (calls->len == 0 || calls->raw_dsml) continue;
+                stats->canonical++;
+                stats->missing_ids += calls->len;
+            }
+        }
+        return;
+    }
+    pthread_mutex_lock(&s->tool_mu);
+    for (int i = 0; i < msgs->len; i++) {
+        tool_calls *calls = &msgs->v[i].calls;
+        if (calls->len == 0 || calls->raw_dsml) continue;
+        const char *matched = NULL;
+        tool_memory_source matched_source = TOOL_MEMORY_DISK;
+        bool exact = true;
+        int missing = 0;
+        for (int j = 0; j < calls->len; j++) {
+            tool_memory_source source = TOOL_MEMORY_DISK;
+            const char *dsml =
+                tool_memory_lookup_locked(&s->tool_mem, calls->v[j].id, &source);
+            if (!dsml) {
+                exact = false;
+                missing++;
+                continue;
+            }
+            if (!matched) {
+                matched = dsml;
+                matched_source = source;
+            } else if (strcmp(matched, dsml)) {
+                exact = false;
+            }
+            if (source == TOOL_MEMORY_RAM) matched_source = TOOL_MEMORY_RAM;
+        }
+        if (exact && matched) {
+            calls->raw_dsml = xstrdup(matched);
+            if (stats) {
+                if (matched_source == TOOL_MEMORY_RAM) stats->mem++;
+                else stats->disk++;
+            }
+        } else if (stats) {
+            stats->canonical++;
+            stats->missing_ids += missing;
+        }
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+static bool tool_calls_contains_id(const tool_calls *calls, const char *id, int upto) {
+    if (!calls || !id || !id[0]) return false;
+    if (upto > calls->len) upto = calls->len;
+    for (int i = 0; i < upto; i++) {
+        if (calls->v[i].id && !strcmp(calls->v[i].id, id)) return true;
+    }
+    return false;
+}
+
+static void assign_tool_call_ids(server *s, tool_calls *calls, api_style api) {
+    if (!calls) return;
+    for (int i = 0; i < calls->len; i++) {
+        if (calls->v[i].id && calls->v[i].id[0]) continue;
+        char id[64];
+        for (;;) {
+            random_tool_id(id, sizeof(id), api);
+            if (!tool_calls_contains_id(calls, id, i) && !tool_memory_has_id(s, id)) break;
+        }
+        calls->v[i].id = xstrdup(id);
+    }
+}
+
+static void apply_openai_stream_tool_ids(tool_calls *calls,
+                                         const openai_stream *st) {
+    if (!calls || !st) return;
+    int n = calls->len < st->tool.ids_cap ? calls->len : st->tool.ids_cap;
+    for (int i = 0; i < n; i++) {
+        if (calls->v[i].id && calls->v[i].id[0]) continue;
+        if (st->tool.ids[i] && st->tool.ids[i][0]) calls->v[i].id = xstrdup(st->tool.ids[i]);
+    }
+}
 
 /* =========================================================================
  * Disk KV Cache.
@@ -4035,9 +4424,13 @@ struct job {
  *   creation time, last-used time, payload byte count
  *   rendered text byte count + rendered text for human inspection
  *   DS4 engine payload written by ds4_session_save_payload()
+ *   optional tool-id map section
  *
  * The filename is SHA1(token ids), not SHA1(text).  The text field is only for
- * observability when looking at a cache directory.
+ * observability when looking at a cache directory.  The optional tool-id map is
+ * not part of model state, but it is needed to render future client JSON back
+ * to the exact DSML sampled by the model.  We persist only mappings whose DSML
+ * block appears in the saved rendered text.
  */
 
 #define KV_CACHE_MAGIC0 'K'
@@ -4056,6 +4449,12 @@ struct job {
 #define KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS 2048
 #define KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS 10000
 #define KV_CACHE_DEFAULT_MB 4096
+#define KV_EXT_TOOL_MAP (1u << 0)
+#define KV_TOOL_MAP_MAGIC0 'K'
+#define KV_TOOL_MAP_MAGIC1 'T'
+#define KV_TOOL_MAP_MAGIC2 'M'
+#define KV_TOOL_MAP_VERSION 1u
+#define KV_TOOL_MAP_HEADER 8u
 
 typedef enum {
     KV_REASON_UNKNOWN   = 0,
@@ -4226,6 +4625,35 @@ static void sha1_tokens_hex(const ds4_tokens *tokens, int n, char out[41]) {
     hex20(digest, out);
 }
 
+static bool id_list_contains(const stop_list *ids, const char *id) {
+    if (!ids || !id || !id[0]) return false;
+    for (int i = 0; i < ids->len; i++) {
+        if (ids->v[i] && !strcmp(ids->v[i], id)) return true;
+    }
+    return false;
+}
+
+static void id_list_push_unique(stop_list *ids, const char *id) {
+    if (!ids || !id || !id[0] || id_list_contains(ids, id)) return;
+    stop_list_push(ids, xstrdup(id));
+}
+
+static void id_list_free(stop_list *ids) {
+    stop_list_clear(ids);
+    free(ids->v);
+    memset(ids, 0, sizeof(*ids));
+}
+
+static void collect_tool_call_ids(const chat_msgs *msgs, stop_list *ids) {
+    if (!msgs || !ids) return;
+    for (int i = 0; i < msgs->len; i++) {
+        const tool_calls *calls = &msgs->v[i].calls;
+        for (int j = 0; j < calls->len; j++) {
+            id_list_push_unique(ids, calls->v[j].id);
+        }
+    }
+}
+
 static bool sha_hex_name(const char *name, char sha[41]) {
     if (strlen(name) != 43 || strcmp(name + 40, ".kv")) return false;
     for (int i = 0; i < 40; i++) {
@@ -4289,8 +4717,94 @@ static void kv_cache_push(kv_disk_cache *kc, kv_entry e) {
     kc->entry[kc->len++] = e;
 }
 
+static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
+                              uint64_t *written_bytes) {
+    if (written_bytes) *written_bytes = 0;
+    if (!s || s->disable_exact_dsml_tool_replay || !fp || !text || !text[0]) return true;
+
+    pthread_mutex_lock(&s->tool_mu);
+    uint32_t count = 0;
+    uint64_t bytes = KV_TOOL_MAP_HEADER;
+    for (int i = 0; i < s->tool_mem.len; i++) {
+        tool_memory_entry *e = &s->tool_mem.entry[i];
+        if (!e->id || !e->dsml || !strstr(text, e->dsml)) continue;
+        size_t id_len = strlen(e->id);
+        size_t dsml_len = strlen(e->dsml);
+        if (id_len > UINT32_MAX || dsml_len > UINT32_MAX) continue;
+        count++;
+        bytes += 8u + (uint64_t)id_len + (uint64_t)dsml_len;
+    }
+    if (count == 0) {
+        pthread_mutex_unlock(&s->tool_mu);
+        return true;
+    }
+
+    uint8_t h[KV_TOOL_MAP_HEADER];
+    h[0] = KV_TOOL_MAP_MAGIC0;
+    h[1] = KV_TOOL_MAP_MAGIC1;
+    h[2] = KV_TOOL_MAP_MAGIC2;
+    h[3] = KV_TOOL_MAP_VERSION;
+    le_put32(h + 4, count);
+    bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h);
+
+    for (int i = 0; ok && i < s->tool_mem.len; i++) {
+        tool_memory_entry *e = &s->tool_mem.entry[i];
+        if (!e->id || !e->dsml || !strstr(text, e->dsml)) continue;
+        size_t id_len = strlen(e->id);
+        size_t dsml_len = strlen(e->dsml);
+        if (id_len > UINT32_MAX || dsml_len > UINT32_MAX) continue;
+        uint8_t lens[8];
+        le_put32(lens, (uint32_t)id_len);
+        le_put32(lens + 4, (uint32_t)dsml_len);
+        ok = fwrite(lens, 1, sizeof(lens), fp) == sizeof(lens) &&
+             fwrite(e->id, 1, id_len, fp) == id_len &&
+             fwrite(e->dsml, 1, dsml_len, fp) == dsml_len;
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+
+    if (ok && written_bytes) *written_bytes = bytes;
+    return ok;
+}
+
+static int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wanted) {
+    if (!s || s->disable_exact_dsml_tool_replay || !fp) return 0;
+    uint8_t h[KV_TOOL_MAP_HEADER];
+    size_t n = fread(h, 1, sizeof(h), fp);
+    if (n == 0 && feof(fp)) return 0;
+    if (n != sizeof(h)) return 0;
+    if (h[0] != KV_TOOL_MAP_MAGIC0 || h[1] != KV_TOOL_MAP_MAGIC1 ||
+        h[2] != KV_TOOL_MAP_MAGIC2 || h[3] != KV_TOOL_MAP_VERSION) return 0;
+
+    uint32_t count = le_get32(h + 4);
+    if (count > DS4_TOOL_MEMORY_MAX_ENTRIES * 4u) return 0;
+    int loaded = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint8_t lens[8];
+        if (fread(lens, 1, sizeof(lens), fp) != sizeof(lens)) return loaded;
+        uint32_t id_len = le_get32(lens);
+        uint32_t dsml_len = le_get32(lens + 4);
+        if (id_len == 0 || id_len > 256 || dsml_len == 0 ||
+            dsml_len > DS4_TOOL_MEMORY_MAX_BYTES) return loaded;
+        char *id = xmalloc((size_t)id_len + 1);
+        char *dsml = xmalloc((size_t)dsml_len + 1);
+        bool ok = fread(id, 1, id_len, fp) == id_len &&
+                  fread(dsml, 1, dsml_len, fp) == dsml_len;
+        id[id_len] = '\0';
+        dsml[dsml_len] = '\0';
+        if (ok && (!wanted || id_list_contains(wanted, id))) {
+            tool_memory_put_source(s, id, dsml, TOOL_MEMORY_DISK);
+            loaded++;
+        }
+        free(id);
+        free(dsml);
+        if (!ok) return loaded;
+    }
+    return loaded;
+}
+
 static void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
-                           uint8_t reason, uint32_t tokens, uint32_t hits, uint32_t ctx_size,
+                           uint8_t reason, uint8_t ext_flags,
+                           uint32_t tokens, uint32_t hits, uint32_t ctx_size,
                            uint64_t created_at, uint64_t last_used,
                            uint64_t payload_bytes) {
     memset(h, 0, KV_CACHE_FIXED_HEADER);
@@ -4300,6 +4814,7 @@ static void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
     h[3] = KV_CACHE_VERSION;
     h[4] = quant_bits;
     h[5] = reason;
+    h[6] = ext_flags;
     le_put32(h + 8, tokens);
     le_put32(h + 12, hits);
     le_put32(h + 16, ctx_size);
@@ -4315,6 +4830,7 @@ static bool kv_read_header(FILE *fp, kv_entry *e, uint32_t *text_bytes) {
         h[2] != KV_CACHE_MAGIC2 || h[3] != KV_CACHE_VERSION) return false;
     e->quant_bits = h[4];
     e->reason = h[5] <= KV_REASON_SHUTDOWN ? h[5] : KV_REASON_UNKNOWN;
+    e->ext_flags = h[6];
     e->tokens = le_get32(h + 8);
     e->hits = le_get32(h + 12);
     e->ctx_size = le_get32(h + 16);
@@ -4342,10 +4858,10 @@ static bool kv_read_entry_file(const char *path, const char sha[41], kv_entry *o
     if (UINT64_MAX - fixed < (uint64_t)text_bytes ||
         UINT64_MAX - fixed - (uint64_t)text_bytes < e.payload_bytes) return false;
     const uint64_t expected = fixed + (uint64_t)text_bytes + e.payload_bytes;
-    if ((uint64_t)st.st_size != expected) return false;
+    if ((uint64_t)st.st_size < expected) return false;
     memcpy(e.sha, sha, 41);
     e.path = xstrdup(path);
-    e.file_size = expected;
+    e.file_size = (uint64_t)st.st_size;
     *out = e;
     return true;
 }
@@ -4376,13 +4892,50 @@ static bool kv_cache_touch_file(const char *path, uint32_t hits) {
     if (ok) {
         uint8_t h[KV_CACHE_FIXED_HEADER];
         uint64_t now = (uint64_t)time(NULL);
-        kv_fill_header(h, e.quant_bits, e.reason, e.tokens, hits, e.ctx_size,
+        kv_fill_header(h, e.quant_bits, e.reason, e.ext_flags, e.tokens, hits, e.ctx_size,
                        e.created_at, now, e.payload_bytes);
         ok = fseek(fp, 0, SEEK_SET) == 0 &&
              fwrite(h, 1, sizeof(h), fp) == sizeof(h);
     }
     fclose(fp);
     return ok;
+}
+
+static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs) {
+    if (!s || s->disable_exact_dsml_tool_replay || !s->kv.enabled || !msgs) return;
+    stop_list wanted = {0};
+    collect_tool_call_ids(msgs, &wanted);
+    if (wanted.len == 0) return;
+
+    DIR *d = opendir(s->kv.dir);
+    if (!d) {
+        id_list_free(&wanted);
+        return;
+    }
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        char sha[41];
+        if (!sha_hex_name(de->d_name, sha)) continue;
+        (void)sha;
+        char *path = path_join(s->kv.dir, de->d_name);
+        FILE *fp = fopen(path, "rb");
+        free(path);
+        if (!fp) continue;
+
+        kv_entry hdr = {0};
+        uint32_t text_bytes = 0;
+        bool ok = kv_read_header(fp, &hdr, &text_bytes);
+        uint64_t skip = (uint64_t)text_bytes + hdr.payload_bytes;
+        if (ok && (hdr.ext_flags & KV_EXT_TOOL_MAP) &&
+            skip <= (uint64_t)INT64_MAX &&
+            fseeko(fp, (off_t)skip, SEEK_CUR) == 0)
+        {
+            kv_tool_map_load_from_pos(s, fp, &wanted);
+        }
+        fclose(fp);
+    }
+    closedir(d);
+    id_list_free(&wanted);
 }
 
 static bool kv_entry_is_live_continued_prefix(const kv_entry *e, const ds4_tokens *live) {
@@ -4531,6 +5084,36 @@ static bool kv_cache_existing_compatible(kv_disk_cache *kc, const char *path, in
     return true;
 }
 
+static void kv_cache_rewrite_tool_map(server *s, const char *path, const char *text) {
+    if (!s || !path || !text || tool_memory_count_dsml_in_text(s, text) == 0) return;
+    FILE *fp = fopen(path, "r+b");
+    if (!fp) return;
+    kv_entry hdr = {0};
+    uint32_t text_bytes = 0;
+    bool ok = kv_read_header(fp, &hdr, &text_bytes);
+    uint64_t end = KV_CACHE_FIXED_HEADER + 4ull + (uint64_t)text_bytes + hdr.payload_bytes;
+    if (ok && end <= (uint64_t)INT64_MAX &&
+        fseeko(fp, (off_t)end, SEEK_SET) == 0 &&
+        ftruncate(fileno(fp), (off_t)end) == 0)
+    {
+        uint64_t ignored = 0;
+        ok = kv_tool_map_write(s, fp, text, &ignored) && fflush(fp) == 0;
+        if (ok && ignored > 0) {
+            uint8_t h[KV_CACHE_FIXED_HEADER];
+            uint64_t now = (uint64_t)time(NULL);
+            kv_fill_header(h, hdr.quant_bits, hdr.reason,
+                           (uint8_t)(hdr.ext_flags | KV_EXT_TOOL_MAP),
+                           hdr.tokens, hdr.hits, hdr.ctx_size,
+                           hdr.created_at, now, hdr.payload_bytes);
+            ok = fseeko(fp, 0, SEEK_SET) == 0 &&
+                 fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
+                 fflush(fp) == 0;
+        }
+    }
+    fclose(fp);
+    (void)ok;
+}
+
 static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
                                        int store_len, const char *reason) {
     kv_disk_cache *kc = &s->kv;
@@ -4550,12 +5133,6 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
         ds4_tokens_free(&store_tokens);
         return false;
     }
-    if (kv_cache_existing_compatible(kc, path, quant_bits, ds4_session_ctx(s->session))) {
-        free(path);
-        ds4_tokens_free(&store_tokens);
-        return true;
-    }
-
     char err[160] = {0};
     /* Disk cache persistence must observe the graph exactly as-is.  If callers
      * want a shorter prefix, they first prefill to that prefix and only then call
@@ -4592,6 +5169,14 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
         return false;
     }
 
+    if (kv_cache_existing_compatible(kc, path, quant_bits, ds4_session_ctx(s->session))) {
+        kv_cache_rewrite_tool_map(s, path, text);
+        free(text);
+        free(path);
+        ds4_tokens_free(&store_tokens);
+        return true;
+    }
+
     buf tmpb = {0};
     buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());
     char *tmp = buf_take(&tmpb);
@@ -4609,15 +5194,19 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
 
     const uint64_t now = (uint64_t)time(NULL);
     uint8_t h[KV_CACHE_FIXED_HEADER];
-    kv_fill_header(h, (uint8_t)quant_bits, kv_reason_code(reason), (uint32_t)store_tokens.len, 0,
+    uint8_t ext_flags = tool_memory_count_dsml_in_text(s, text) > 0 ? KV_EXT_TOOL_MAP : 0;
+    kv_fill_header(h, (uint8_t)quant_bits, kv_reason_code(reason), ext_flags,
+                   (uint32_t)store_tokens.len, 0,
                    (uint32_t)ds4_session_ctx(s->session), now, now, payload_bytes);
     uint8_t tb[4];
     le_put32(tb, (uint32_t)text_len);
+    uint64_t tool_map_bytes = 0;
     errno = 0;
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
               fwrite(text, 1, text_len, fp) == text_len &&
               ds4_session_save_payload(s->session, fp, err, sizeof(err)) == 0 &&
+              kv_tool_map_write(s, fp, text, &tool_map_bytes) &&
               fflush(fp) == 0;
     int saved_errno = errno;
     if (fclose(fp) != 0) {
@@ -4641,7 +5230,7 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
                    store_tokens.len,
                    original_len - store_tokens.len,
                    reason,
-                   (double)(KV_CACHE_FIXED_HEADER + 4ull + text_len + payload_bytes) / (1024.0 * 1024.0),
+                   (double)(KV_CACHE_FIXED_HEADER + 4ull + text_len + payload_bytes + tool_map_bytes) / (1024.0 * 1024.0),
                    save_ms);
         kv_cache_evict(kc, live_tokens);
     }
@@ -4720,6 +5309,7 @@ static int kv_cache_try_load_tokens(server *s, const ds4_tokens *prompt, char **
             ds4_tokens_starts_with(prompt, loaded_tokens))
         {
             loaded = (int)hdr.tokens;
+            if (hdr.ext_flags & KV_EXT_TOOL_MAP) kv_tool_map_load_from_pos(s, fp, NULL);
         } else {
             ds4_session_invalidate(s->session);
             unlink(path);
@@ -4868,6 +5458,7 @@ static void trace_write_token(FILE *fp, ds4_engine *engine, int token) {
 static void trace_write_cache_diag(
         server *s,
         const trace_cache_diag *d,
+        const tool_replay_stats *tool_replay,
         int cached,
         const char *cache_source,
         int disk_cached,
@@ -4880,6 +5471,7 @@ static void trace_write_cache_diag(
             "live_prompt_common: %d\n"
             "memory_reusable: %d\n"
             "memory_miss_reason: %s\n"
+            "tool_replay: mem=%d disk=%d canonical=%d missing_ids=%d\n"
             "cache_source: %s\n"
             "cached_tokens: %d\n"
             "disk_cached_tokens: %d\n",
@@ -4889,6 +5481,10 @@ static void trace_write_cache_diag(
             d && d->valid && d->old_pos > 0 &&
                 d->common == d->old_pos && d->prompt_len >= d->old_pos ? 1 : 0,
             trace_cache_miss_reason(d),
+            tool_replay ? tool_replay->mem : 0,
+            tool_replay ? tool_replay->disk : 0,
+            tool_replay ? tool_replay->canonical : 0,
+            tool_replay ? tool_replay->missing_ids : 0,
             cache_source ? cache_source : "none",
             cached,
             disk_cached);
@@ -4963,7 +5559,8 @@ static uint64_t trace_begin(
             (unsigned long long)j->req.seed);
     fprintf(s->trace, "stream_include_usage: %d\n",
             j->req.stream_include_usage ? 1 : 0);
-    trace_write_cache_diag(s, cache_diag, cached, cache_source, disk_cached, disk_path);
+    trace_write_cache_diag(s, cache_diag, &j->req.tool_replay, cached,
+                           cache_source, disk_cached, disk_path);
     if (j->req.raw_body) {
         fputs("\n--- raw request json ---\n", s->trace);
         fputs(j->req.raw_body, s->trace);
@@ -5212,17 +5809,16 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
         buf_puts(&suffix, "</think>");
     }
     buf_puts(&suffix, content ? content : "");
-    append_dsml_tool_calls_text(&suffix, calls, &r->tool_orders);
+    append_dsml_tool_calls_text(&suffix, calls);
     buf_puts(&suffix, "<｜end▁of▁sentence｜>");
     return buf_take(&suffix);
 }
 
-/* Tool calls have two textual forms: the model's raw DSML text and the
- * canonical JSON/schema ordering the client will send back on the next turn.
- * After a successful tool-call finish, adjust the live checkpoint to the
- * canonical form when it is a continuation of the prompt.  This prevents a
- * later request from missing the memory cache only because field ordering or
- * DSML formatting changed. */
+/* After a successful tool-call finish, make the live checkpoint match what the
+ * next request will render.  Usually that is just the exact DSML remembered by
+ * tool id.  If a client sends a tool call without an id we know, the fallback
+ * renderer still builds valid DSML from JSON, and this function either rewrites
+ * the short suffix in place or reloads an older disk checkpoint before replay. */
 static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ctx,
                                          uint64_t trace_id, const char *content,
                                          const char *reasoning, const tool_calls *calls) {
@@ -5568,7 +6164,7 @@ static void generate_job(server *s, job *j) {
                 break;
             }
             if (openai_live_chat &&
-                !openai_sse_stream_update(j->fd, &j->req, id,
+                !openai_sse_stream_update(j->fd, s, &j->req, id,
                                           &openai_live, text.ptr, stream_len,
                                           false)) {
                 finish = "error";
@@ -5621,7 +6217,9 @@ static void generate_job(server *s, job *j) {
                                     &last_decode_log_t,
                                     &last_decode_log_completion);
                 next_decode_log += 50;
-                kv_cache_maybe_store_continued(s);
+                if (!(j->req.kind == REQ_CHAT && j->req.has_tools && saw_tool_start)) {
+                    kv_cache_maybe_store_continued(s);
+                }
             }
 
             if (hit_stop) {
@@ -5667,7 +6265,11 @@ static void generate_job(server *s, job *j) {
                             decode_t0,
                             &last_decode_log_t,
                             &last_decode_log_completion);
-        if (strcmp(finish, "error") != 0) kv_cache_maybe_store_continued(s);
+        if (strcmp(finish, "error") != 0 &&
+            !(j->req.kind == REQ_CHAT && j->req.has_tools && saw_tool_start))
+        {
+            kv_cache_maybe_store_continued(s);
+        }
     }
 
     if (j->req.stream && !structured_stream && text.len > plain_stream_pos) {
@@ -5694,7 +6296,12 @@ static void generate_job(server *s, job *j) {
                 snprintf(err, sizeof(err), "invalid tool call");
             }
         }
-        if (parsed_calls.len) final_finish = "tool_calls";
+        if (parsed_calls.len) {
+            if (openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &openai_live);
+            assign_tool_call_ids(s, &parsed_calls, j->req.api);
+            tool_memory_remember(s, &parsed_calls);
+            final_finish = "tool_calls";
+        }
     }
     log_tool_calls_summary(ctx_span, &parsed_calls);
 
@@ -5716,7 +6323,7 @@ static void generate_job(server *s, job *j) {
                                                     text.ptr ? text.ptr : "", text.len,
                                                     &parsed_calls, final_finish, completion);
         } else if (openai_live_chat) {
-            response_ok = openai_sse_finish_live(j->fd, &j->req, id, &openai_live,
+            response_ok = openai_sse_finish_live(j->fd, s, &j->req, id, &openai_live,
                                                  text.ptr ? text.ptr : "", text.len,
                                                  &parsed_calls, final_finish,
                                                  j->req.prompt.len, completion);
@@ -5810,6 +6417,7 @@ static void generate_job(server *s, job *j) {
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
+    openai_stream_free(&openai_live);
     buf_free(&text);
 }
 
@@ -6037,10 +6645,10 @@ static void *client_main(void *arg) {
     bool ok = false;
     const int ctx_size = ds4_session_ctx(s->session);
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
-        ok = parse_anthropic_request(s->engine, hr.body, s->default_tokens,
+        ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
-        ok = parse_chat_request(s->engine, hr.body, s->default_tokens,
+        ok = parse_chat_request(s->engine, s, hr.body, s->default_tokens,
                                 ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/completions")) {
         ok = parse_completion_request(s->engine, hr.body, s->default_tokens,
@@ -6140,6 +6748,7 @@ typedef struct {
     uint64_t kv_disk_space_mb;
     kv_cache_options kv_cache;
     bool kv_cache_reject_different_quant;
+    bool disable_exact_dsml_tool_replay;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -6198,6 +6807,8 @@ static void server_close_resources(server *s) {
         s->trace = NULL;
     }
     kv_cache_close(&s->kv);
+    tool_memory_free(&s->tool_mem);
+    pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->trace_mu);
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
@@ -6264,6 +6875,8 @@ static void usage(FILE *fp) {
         "      Align cold boundary saves down to this token multiple. 0 disables alignment. Default: 2048\n"
         "  --kv-cache-reject-different-quant\n"
         "      Refuse checkpoints written by the same model with a different routed-expert quantization.\n"
+        "  --disable-exact-dsml-tool-replay\n"
+        "      Disable the tool-id -> exact sampled DSML map. Tool history falls back to canonical JSON rendering.\n"
         "\n"
         "  Cache triggers:\n"
         "      cold       save a stable prefix of a long first prompt before generation starts\n"
@@ -6339,6 +6952,8 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache.boundary_align_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-reject-different-quant")) {
             c.kv_cache_reject_different_quant = true;
+        } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
+            c.disable_exact_dsml_tool_replay = true;
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--warm-weights")) {
@@ -6391,13 +7006,19 @@ int main(int argc, char **argv) {
     s.engine = engine;
     s.session = session;
     s.default_tokens = cfg.default_tokens;
+    s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
     }
+    if (s.disable_exact_dsml_tool_replay) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: exact DSML tool replay disabled; tool history uses canonical JSON rendering");
+    }
     pthread_mutex_init(&s.mu, NULL);
     pthread_cond_init(&s.cv, NULL);
     pthread_cond_init(&s.clients_cv, NULL);
+    pthread_mutex_init(&s.tool_mu, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
     if (cfg.trace_path) {
         s.trace = fopen(cfg.trace_path, "w");
@@ -6637,17 +7258,17 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
     openai_stream st;
     openai_stream_start(&r, &st);
     const char *raw1 = "<think>need a tool</think>Hello.\n\n";
-    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_test", &st,
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_test", &st,
                                          raw1, strlen(raw1), false));
 
     const char *raw =
         "<think>need a tool</think>Hello.\n\n"
         DS4_TOOL_CALLS_START "\n";
-    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_test", &st,
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_test", &st,
                                          raw, strlen(raw), false));
 
     tool_calls calls = make_swapped_bash_call();
-    TEST_ASSERT(openai_sse_finish_live(sv[0], &r, "chatcmpl_test", &st,
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_test", &st,
                                        raw, strlen(raw), &calls,
                                        "tool_calls", 10, 8));
     shutdown(sv[0], SHUT_WR);
@@ -6696,12 +7317,12 @@ static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
     openai_stream st;
     openai_stream_start(&r, &st);
     const char *raw1 = "We need to generate a title";
-    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_title", &st,
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_title", &st,
                                          raw1, strlen(raw1), false));
 
     const char *raw2 =
         "We need to generate a title</think>Free disk space check";
-    TEST_ASSERT(openai_sse_finish_live(sv[0], &r, "chatcmpl_title", &st,
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_title", &st,
                                        raw2, strlen(raw2), NULL,
                                        "stop", 12, 8));
     shutdown(sv[0], SHUT_WR);
@@ -6725,6 +7346,7 @@ static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
     TEST_ASSERT(strstr(out, "</think>") == NULL);
 
     free(out);
+    openai_stream_free(&st);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -6752,7 +7374,7 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
         DS4_TOOL_CALLS_START "\n"
         DS4_INVOKE_START " name=\"bash\">\n"
         DS4_PARAM_START " name=\"command\" string=\"true\">echo partial";
-    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_partial_tool", &st,
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_partial_tool", &st,
                                          raw, strlen(raw), false));
 
     const char *raw_complete =
@@ -6762,7 +7384,7 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
         DS4_PARAM_START " name=\"command\" string=\"true\">echo partial done" DS4_PARAM_END "\n"
         DS4_INVOKE_END "\n"
         DS4_TOOL_CALLS_END;
-    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_partial_tool", &st,
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_partial_tool", &st,
                                          raw_complete, strlen(raw_complete), false));
 
     char *parsed_content = NULL;
@@ -6770,7 +7392,10 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
     tool_calls calls = {0};
     TEST_ASSERT(parse_generated_message(raw_complete, &parsed_content, &parsed_reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
-    TEST_ASSERT(openai_sse_finish_live(sv[0], &r, "chatcmpl_partial_tool", &st,
+    apply_openai_stream_tool_ids(&calls, &st);
+    TEST_ASSERT(calls.v[0].id != NULL);
+    TEST_ASSERT(!strncmp(calls.v[0].id, "call_", 5));
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_partial_tool", &st,
                                        raw_complete, strlen(raw_complete), &calls,
                                        "tool_calls", 10, 4));
 
@@ -6783,12 +7408,13 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
     const char *partial = strstr(out, "\"arguments\":\"echo partial\"");
     const char *rest = strstr(out, "\"arguments\":\" done\"");
     int tool_id_count = 0;
-    for (const char *p = out; (p = strstr(p, "chatcmpl_partial_tool_tool_0")) != NULL; p++) tool_id_count++;
+    for (const char *p = out; (p = strstr(p, "\"id\":\"call_")) != NULL; p++) tool_id_count++;
     TEST_ASSERT(text != NULL);
     TEST_ASSERT(tool != NULL);
     TEST_ASSERT(key != NULL);
     TEST_ASSERT(partial != NULL);
     TEST_ASSERT(rest != NULL);
+    TEST_ASSERT(strstr(out, calls.v[0].id) != NULL);
     TEST_ASSERT(text < tool);
     TEST_ASSERT(tool < partial);
     TEST_ASSERT(partial < rest);
@@ -6800,6 +7426,7 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&calls);
+    openai_stream_free(&st);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -6820,7 +7447,7 @@ static void test_openai_tool_stream_waits_for_incomplete_tool_tags(void) {
     openai_stream st;
     openai_stream_start(&r, &st);
     const char *raw_invoke = DS4_TOOL_CALLS_START "\n" DS4_INVOKE_START;
-    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_incomplete_tool", &st,
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_incomplete_tool", &st,
                                          raw_invoke, strlen(raw_invoke), false));
     TEST_ASSERT(st.mode == OPENAI_STREAM_TOOL);
     TEST_ASSERT(st.tool.state == OPENAI_TOOL_BETWEEN_INVOKES);
@@ -6829,7 +7456,7 @@ static void test_openai_tool_stream_waits_for_incomplete_tool_tags(void) {
         DS4_TOOL_CALLS_START "\n"
         DS4_INVOKE_START " name=\"bash\">\n"
         DS4_PARAM_START;
-    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_incomplete_tool", &st,
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_incomplete_tool", &st,
                                          raw_param, strlen(raw_param), false));
     TEST_ASSERT(st.mode == OPENAI_STREAM_TOOL);
     TEST_ASSERT(st.tool.state == OPENAI_TOOL_BETWEEN_PARAMS);
@@ -6840,6 +7467,7 @@ static void test_openai_tool_stream_waits_for_incomplete_tool_tags(void) {
     TEST_ASSERT(strstr(out, DS4_PARAM_START) == NULL);
 
     free(out);
+    openai_stream_free(&st);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -6863,7 +7491,7 @@ static void test_openai_tool_stream_sends_partial_raw_arguments(void) {
         DS4_TOOL_CALLS_START "\n"
         DS4_INVOKE_START " name=\"edit\">\n"
         DS4_PARAM_START " name=\"edits\" string=\"false\">[1,2,3";
-    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_raw_tool", &st,
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_raw_tool", &st,
                                          raw, strlen(raw), false));
 
     shutdown(sv[0], SHUT_WR);
@@ -6875,6 +7503,7 @@ static void test_openai_tool_stream_sends_partial_raw_arguments(void) {
     TEST_ASSERT(strstr(out, DS4_TOOL_CALLS_START) == NULL);
 
     free(out);
+    openai_stream_free(&st);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -6898,7 +7527,7 @@ static void test_openai_tool_stream_holds_partial_dsml_entities(void) {
         DS4_TOOL_CALLS_START "\n"
         DS4_INVOKE_START " name=\"bash\">\n"
         DS4_PARAM_START " name=\"command\" string=\"true\">echo &amp";
-    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_entity_tool", &st,
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_entity_tool", &st,
                                          raw_partial, strlen(raw_partial), false));
 
     const char *raw_complete =
@@ -6907,7 +7536,7 @@ static void test_openai_tool_stream_holds_partial_dsml_entities(void) {
         DS4_PARAM_START " name=\"command\" string=\"true\">echo &amp; done" DS4_PARAM_END "\n"
         DS4_INVOKE_END "\n"
         DS4_TOOL_CALLS_END;
-    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_entity_tool", &st,
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_entity_tool", &st,
                                          raw_complete, strlen(raw_complete), false));
 
     shutdown(sv[0], SHUT_WR);
@@ -6918,6 +7547,7 @@ static void test_openai_tool_stream_holds_partial_dsml_entities(void) {
     TEST_ASSERT(strstr(out, "&amp") == NULL);
 
     free(out);
+    openai_stream_free(&st);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -6952,14 +7582,14 @@ static void test_openai_tool_stream_holds_partial_utf8_arguments(void) {
     buf_append(&partial, prefix, strlen(prefix));
     buf_putc(&partial, (char)0xf0);
     buf_putc(&partial, (char)0x9f);
-    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_utf8_tool", &st,
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_utf8_tool", &st,
                                          partial.ptr, partial.len, false));
 
     buf complete = {0};
     buf_append(&complete, prefix, strlen(prefix));
     buf_append(&complete, flag_utf8, 4);
     buf_append(&complete, suffix, strlen(suffix));
-    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_utf8_tool", &st,
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_utf8_tool", &st,
                                          complete.ptr, complete.len, false));
 
     shutdown(sv[0], SHUT_WR);
@@ -6972,6 +7602,7 @@ static void test_openai_tool_stream_holds_partial_utf8_arguments(void) {
     free(out);
     buf_free(&partial);
     buf_free(&complete);
+    openai_stream_free(&st);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -7000,20 +7631,22 @@ static void test_openai_tool_stream_handles_multiple_calls(void) {
         DS4_PARAM_START " name=\"command\" string=\"true\">wc -l a.c" DS4_PARAM_END "\n"
         DS4_INVOKE_END "\n"
         DS4_TOOL_CALLS_END;
-    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_multi_tool", &st,
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_multi_tool", &st,
                                          raw, strlen(raw), false));
 
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
-    TEST_ASSERT(strstr(out, "chatcmpl_multi_tool_tool_0") != NULL);
-    TEST_ASSERT(strstr(out, "chatcmpl_multi_tool_tool_1") != NULL);
+    int tool_id_count = 0;
+    for (const char *p = out; (p = strstr(p, "\"id\":\"call_")) != NULL; p++) tool_id_count++;
+    TEST_ASSERT(tool_id_count == 2);
     TEST_ASSERT(strstr(out, "\"name\":\"read\"") != NULL);
     TEST_ASSERT(strstr(out, "\"name\":\"bash\"") != NULL);
     TEST_ASSERT(strstr(out, "\\\"path\\\":") != NULL);
     TEST_ASSERT(strstr(out, "\\\"command\\\":") != NULL);
 
     free(out);
+    openai_stream_free(&st);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -7042,9 +7675,9 @@ static void test_streaming_holds_partial_utf8(void) {
 
     openai_stream st;
     openai_stream_start(&r, &st);
-    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_utf8", &st,
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_utf8", &st,
                                          partial, strlen(partial), false));
-    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_utf8", &st,
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_utf8", &st,
                                          complete, strlen(complete), false));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
@@ -7054,6 +7687,7 @@ static void test_streaming_holds_partial_utf8(void) {
     TEST_ASSERT(strstr(out, replacement) == NULL);
 
     free(out);
+    openai_stream_free(&st);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -7195,25 +7829,23 @@ static void test_render_preserves_reasoning_with_tools(void) {
     chat_msgs_free(&msgs);
 }
 
-static void test_dsml_tool_args_are_schema_ordered(void) {
-    tool_schema_orders orders = make_bash_order();
+static void test_dsml_tool_args_preserve_call_order(void) {
     tool_calls calls = make_swapped_bash_call();
     buf b = {0};
-    append_dsml_tool_calls_text(&b, &calls, &orders);
+    append_dsml_tool_calls_text(&b, &calls);
     const char *command = strstr(b.ptr, "name=\"command\"");
     const char *description = strstr(b.ptr, "name=\"description\"");
     const char *timeout = strstr(b.ptr, "name=\"timeout\"");
     TEST_ASSERT(command != NULL);
     TEST_ASSERT(description != NULL);
     TEST_ASSERT(timeout != NULL);
-    TEST_ASSERT(command < description);
-    TEST_ASSERT(description < timeout);
+    TEST_ASSERT(description < command);
+    TEST_ASSERT(command < timeout);
     buf_free(&b);
     tool_calls_free(&calls);
-    tool_schema_orders_free(&orders);
 }
 
-static void test_openai_tool_args_are_schema_ordered(void) {
+static void test_openai_tool_args_preserve_call_order(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
     r.tool_orders = make_bash_order();
@@ -7226,14 +7858,14 @@ static void test_openai_tool_args_are_schema_ordered(void) {
     TEST_ASSERT(command != NULL);
     TEST_ASSERT(description != NULL);
     TEST_ASSERT(timeout != NULL);
-    TEST_ASSERT(command < description);
-    TEST_ASSERT(description < timeout);
+    TEST_ASSERT(description < command);
+    TEST_ASSERT(command < timeout);
     buf_free(&b);
     tool_calls_free(&calls);
     request_free(&r);
 }
 
-static void test_anthropic_thinking_and_tool_args_are_schema_ordered(void) {
+static void test_anthropic_thinking_and_tool_args_preserve_call_order(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
     r.tool_orders = make_bash_order();
@@ -7252,7 +7884,7 @@ static void test_anthropic_thinking_and_tool_args_are_schema_ordered(void) {
     TEST_ASSERT(text < tool);
     TEST_ASSERT(command != NULL);
     TEST_ASSERT(description != NULL);
-    TEST_ASSERT(command < description);
+    TEST_ASSERT(description < command);
     buf_free(&b);
     tool_calls_free(&calls);
     request_free(&r);
@@ -7284,7 +7916,7 @@ static void test_parse_short_dsml_and_canonical_suffix(void) {
     const char *description = strstr(suffix, "name=\"description\"");
     TEST_ASSERT(command != NULL);
     TEST_ASSERT(description != NULL);
-    TEST_ASSERT(command < description);
+    TEST_ASSERT(description < command);
     TEST_ASSERT(strstr(suffix, "</think>") != NULL);
     TEST_ASSERT(strstr(suffix, "<｜end▁of▁sentence｜>") != NULL);
 
@@ -7313,7 +7945,7 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
         "need a tool</think>\n\n"
         DS4_TOOL_CALLS_START "\n"
         "<｜DSML｜invoke name=\"bash\">\n"
-        "<｜DSML｜parameter name=\"command\" string=\"true\">cd /tmp &amp;&amp; git diff 2&gt;/dev/null</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">cd /tmp && git diff 2>/dev/null</｜DSML｜parameter>\n"
         "<｜DSML｜parameter name=\"timeout\" string=\"false\">10</｜DSML｜parameter>\n"
         "</｜DSML｜invoke>\n"
         "</｜DSML｜tool_calls>";
@@ -7331,6 +7963,9 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     r.tool_orders = orders;
     memset(&orders, 0, sizeof(orders));
     char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, &calls);
+    TEST_ASSERT(strstr(suffix, "cd /tmp && git diff 2>/dev/null") != NULL);
+    TEST_ASSERT(strstr(suffix, "&amp;&amp;") == NULL);
+    TEST_ASSERT(strstr(suffix, "2&gt;/dev/null") == NULL);
     buf canonical = {0};
     buf_puts(&canonical, prompt_text);
     buf_puts(&canonical, suffix);
@@ -7439,6 +8074,110 @@ static void test_tool_checkpoint_minifies_json_parameters(void) {
     tool_schema_orders_free(&orders);
 }
 
+static void test_tool_memory_replays_sampled_dsml(void) {
+    const char *generated =
+        "<think>need shell</think>\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls -la</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"timeout\" string=\"false\">10</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"description\" string=\"true\">list files</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls sampled = {0};
+    TEST_ASSERT(parse_generated_message(generated, &content, &reasoning, &sampled));
+    TEST_ASSERT(sampled.len == 1);
+
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.tool_mu, NULL);
+    assign_tool_call_ids(&s, &sampled, API_OPENAI);
+    TEST_ASSERT(sampled.v[0].id != NULL);
+    TEST_ASSERT(!strncmp(sampled.v[0].id, "call_", 5));
+    tool_memory_remember(&s, &sampled);
+
+    chat_msgs msgs = {0};
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.reasoning = xstrdup(reasoning ? reasoning : "");
+    assistant.content = xstrdup(content ? content : "");
+    tool_call tc = {0};
+    tc.id = xstrdup(sampled.v[0].id);
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"description\":\"list files\",\"command\":\"ls -la\",\"timeout\":10}");
+    tool_calls_push(&assistant.calls, tc);
+    chat_msgs_push(&msgs, assistant);
+
+    tool_replay_stats stats = {0};
+    tool_memory_attach_to_messages(&s, &msgs, &stats);
+    TEST_ASSERT(msgs.v[0].calls.raw_dsml != NULL);
+    TEST_ASSERT(stats.mem == 1);
+    TEST_ASSERT(stats.disk == 0);
+    TEST_ASSERT(stats.canonical == 0);
+    TEST_ASSERT(stats.missing_ids == 0);
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    const char *command = strstr(prompt, "name=\"command\"");
+    const char *timeout = strstr(prompt, "name=\"timeout\"");
+    const char *description = strstr(prompt, "name=\"description\"");
+    TEST_ASSERT(command != NULL);
+    TEST_ASSERT(timeout != NULL);
+    TEST_ASSERT(description != NULL);
+    TEST_ASSERT(command < timeout);
+    TEST_ASSERT(timeout < description);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&sampled);
+    tool_memory_free(&s.tool_mem);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+static void test_exact_dsml_tool_replay_can_be_disabled(void) {
+    const char *dsml =
+        "\n\n<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">pwd</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    tool_memory_put(&s, "call_disabled", dsml);
+    s.disable_exact_dsml_tool_replay = true;
+
+    chat_msgs msgs = {0};
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    tool_call tc = {0};
+    tc.id = xstrdup("call_disabled");
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"canonical\"}");
+    tool_calls_push(&assistant.calls, tc);
+    chat_msgs_push(&msgs, assistant);
+
+    tool_replay_stats stats = {0};
+    tool_memory_attach_to_messages(&s, &msgs, &stats);
+    TEST_ASSERT(msgs.v[0].calls.raw_dsml == NULL);
+    TEST_ASSERT(stats.canonical == 1);
+    TEST_ASSERT(stats.missing_ids == 1);
+
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    uint64_t bytes = 123;
+    TEST_ASSERT(kv_tool_map_write(&s, fp, dsml, &bytes));
+    TEST_ASSERT(bytes == 0);
+
+    if (fp) fclose(fp);
+    chat_msgs_free(&msgs);
+    tool_memory_free(&s.tool_mem);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
 static void test_tool_separator_whitespace_is_not_content(void) {
     const char *generated =
         "<think>need a tool</think>"
@@ -7466,13 +8205,26 @@ static void test_dsml_prompt_escapes_tool_supplied_text(void) {
     tool_calls calls = {0};
     tool_call tc = {0};
     tc.name = xstrdup("bash");
-    tc.arguments = xstrdup("{\"command\":\"echo </｜DSML｜tool_calls>\",\"count\":1}");
+    tc.arguments = xstrdup("{\"command\":\"echo 2>&1 && echo </｜DSML｜tool_calls>\",\"count\":1}");
     tool_calls_push(&calls, tc);
 
     buf b = {0};
-    append_dsml_tool_calls_text(&b, &calls, NULL);
-    TEST_ASSERT(strstr(b.ptr, "echo &lt;/｜DSML｜tool_calls&gt;") != NULL);
-    TEST_ASSERT(strstr(b.ptr, "echo </｜DSML｜tool_calls>") == NULL);
+    append_dsml_tool_calls_text(&b, &calls);
+    TEST_ASSERT(strstr(b.ptr, "echo 2>&1 && echo </｜DSML｜tool_calls>") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "2&gt;&amp;1") == NULL);
+    TEST_ASSERT(strstr(b.ptr, "&amp;&amp;") == NULL);
+    buf_free(&b);
+    tool_calls_free(&calls);
+
+    memset(&calls, 0, sizeof(calls));
+    memset(&tc, 0, sizeof(tc));
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"echo </｜DSML｜parameter>\",\"count\":1}");
+    tool_calls_push(&calls, tc);
+
+    append_dsml_tool_calls_text(&b, &calls);
+    TEST_ASSERT(strstr(b.ptr, "echo &lt;/｜DSML｜parameter>") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "echo </｜DSML｜parameter>") == NULL);
     buf_free(&b);
     tool_calls_free(&calls);
 
@@ -7641,7 +8393,7 @@ static void test_kv_stub_file(const char *dir, const char *sha,
     }
 
     uint8_t h[KV_CACHE_FIXED_HEADER];
-    kv_fill_header(h, 2, reason, tokens, hits, 32768, 100, last_used, payload_bytes);
+    kv_fill_header(h, 2, reason, 0, tokens, hits, 32768, 100, last_used, payload_bytes);
     uint8_t text_len[4] = {0};
     TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
     TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
@@ -7650,6 +8402,138 @@ static void test_kv_stub_file(const char *dir, const char *sha,
     }
     TEST_ASSERT(fclose(fp) == 0);
     free(path);
+}
+
+static void test_kv_tool_map_filters_by_dsml_text(void) {
+    const char *dsml_keep =
+        "\n\n<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">pwd</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    const char *dsml_drop =
+        "\n\n<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">zzzz</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+
+    server src = {0}, dst = {0};
+    pthread_mutex_init(&src.tool_mu, NULL);
+    pthread_mutex_init(&dst.tool_mu, NULL);
+    tool_memory_put(&src, "call_keep", dsml_keep);
+    tool_memory_put(&src, "call_drop", dsml_drop);
+
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    uint64_t bytes = 0;
+    TEST_ASSERT(kv_tool_map_write(&src, fp, dsml_keep, &bytes));
+    TEST_ASSERT(bytes > 0);
+    rewind(fp);
+    TEST_ASSERT(kv_tool_map_load_from_pos(&dst, fp, NULL) == 1);
+
+    chat_msgs msgs = {0};
+    chat_msg a = {0};
+    a.role = xstrdup("assistant");
+    tool_call keep = {.id = xstrdup("call_keep"), .name = xstrdup("bash"), .arguments = xstrdup("{}")};
+    tool_calls_push(&a.calls, keep);
+    chat_msgs_push(&msgs, a);
+    chat_msg b = {0};
+    b.role = xstrdup("assistant");
+    tool_call drop = {.id = xstrdup("call_drop"), .name = xstrdup("bash"), .arguments = xstrdup("{}")};
+    tool_calls_push(&b.calls, drop);
+    chat_msgs_push(&msgs, b);
+    tool_replay_stats stats = {0};
+    tool_memory_attach_to_messages(&dst, &msgs, &stats);
+    TEST_ASSERT(msgs.v[0].calls.raw_dsml != NULL);
+    TEST_ASSERT(msgs.v[1].calls.raw_dsml == NULL);
+    TEST_ASSERT(stats.disk == 1);
+    TEST_ASSERT(stats.canonical == 1);
+    TEST_ASSERT(stats.missing_ids == 1);
+    TEST_ASSERT(strstr(msgs.v[0].calls.raw_dsml, "pwd") != NULL);
+    TEST_ASSERT(strstr(msgs.v[0].calls.raw_dsml, "zzzz") == NULL);
+
+    chat_msgs_free(&msgs);
+    if (fp) fclose(fp);
+    tool_memory_free(&src.tool_mem);
+    tool_memory_free(&dst.tool_mem);
+    pthread_mutex_destroy(&src.tool_mu);
+    pthread_mutex_destroy(&dst.tool_mu);
+}
+
+static void test_kv_tool_map_restores_before_prompt_render(void) {
+    char tmpl[] = "/tmp/ds4-kv-tool-map-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *sha = "3333333333333333333333333333333333333333";
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    const char *dsml =
+        "\n\n<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">echo exact</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    const char *text = dsml;
+
+    server src = {0};
+    pthread_mutex_init(&src.tool_mu, NULL);
+    tool_memory_put(&src, "call_disk", dsml);
+
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        uint8_t h[KV_CACHE_FIXED_HEADER];
+        kv_fill_header(h, 2, KV_REASON_CONTINUED, KV_EXT_TOOL_MAP, 512, 0, 32768, 100, 100, 0);
+        uint8_t text_len[4];
+        le_put32(text_len, (uint32_t)strlen(text));
+        TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+        TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
+        TEST_ASSERT(fwrite(text, 1, strlen(text), fp) == strlen(text));
+        uint64_t ignored = 0;
+        TEST_ASSERT(kv_tool_map_write(&src, fp, dsml, &ignored));
+        TEST_ASSERT(fclose(fp) == 0);
+    }
+
+    server dst = {0};
+    pthread_mutex_init(&dst.tool_mu, NULL);
+    dst.kv.enabled = true;
+    dst.kv.dir = xstrdup(dir);
+    dst.kv.opt = kv_cache_default_options();
+
+    chat_msgs msgs = {0};
+    chat_msg a = {0};
+    a.role = xstrdup("assistant");
+    tool_call tc = {0};
+    tc.id = xstrdup("call_disk");
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"echo canonical\"}");
+    tool_calls_push(&a.calls, tc);
+    chat_msgs_push(&msgs, a);
+
+    kv_cache_restore_tool_memory_for_messages(&dst, &msgs);
+    tool_replay_stats stats = {0};
+    tool_memory_attach_to_messages(&dst, &msgs, &stats);
+    TEST_ASSERT(msgs.v[0].calls.raw_dsml != NULL);
+    TEST_ASSERT(stats.disk == 1);
+    TEST_ASSERT(stats.canonical == 0);
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(strstr(prompt, "echo exact") != NULL);
+    TEST_ASSERT(strstr(prompt, "echo canonical") == NULL);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+    kv_cache_close(&dst.kv);
+    tool_memory_free(&src.tool_mem);
+    tool_memory_free(&dst.tool_mem);
+    pthread_mutex_destroy(&src.tool_mu);
+    pthread_mutex_destroy(&dst.tool_mu);
+    unlink(path);
+    free(path);
+    rmdir(dir);
 }
 
 static void test_kv_cache_eviction_values_fresh_snapshots(void) {
@@ -7737,9 +8621,9 @@ static void ds4_server_unit_tests_run(void) {
     test_render_preserves_reasoning_with_tools();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
-    test_dsml_tool_args_are_schema_ordered();
-    test_openai_tool_args_are_schema_ordered();
-    test_anthropic_thinking_and_tool_args_are_schema_ordered();
+    test_dsml_tool_args_preserve_call_order();
+    test_openai_tool_args_preserve_call_order();
+    test_anthropic_thinking_and_tool_args_preserve_call_order();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_openai_tool_stream_sends_incremental_text();
     test_openai_chat_stream_splits_reasoning_without_tools();
@@ -7753,6 +8637,10 @@ static void ds4_server_unit_tests_run(void) {
     test_parse_short_dsml_and_canonical_suffix();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
     test_tool_checkpoint_minifies_json_parameters();
+    test_tool_memory_replays_sampled_dsml();
+    test_exact_dsml_tool_replay_can_be_disabled();
+    test_kv_tool_map_filters_by_dsml_text();
+    test_kv_tool_map_restores_before_prompt_render();
     test_tool_separator_whitespace_is_not_content();
     test_dsml_prompt_escapes_tool_supplied_text();
     test_stop_list_parses_all_sequences();
