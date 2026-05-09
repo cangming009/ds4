@@ -98,6 +98,7 @@ int ds4_engine_generate_argmax(ds4_engine *e, const ds4_tokens *prompt,
                                ds4_session_progress_fn progress,
                                void *progress_ud);
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
+int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);

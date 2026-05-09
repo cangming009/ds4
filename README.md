@@ -499,3 +499,24 @@ make test                  # ./ds4_test --all
 ./ds4_test --logprob-vectors
 ./ds4_test --server
 ```
+
+## Debugging Notes
+
+When a generation looks wrong, three small tools are usually enough to get a
+first answer:
+
+```sh
+./ds4 --dump-tokens -p "..."
+./ds4 --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
+./ds4-server --trace /tmp/ds4-trace.txt ...
+```
+
+- `--dump-tokens` tokenizes the `-p` or `--prompt-file` string exactly as
+  written, recognizes DS4 protocol specials, and then exits before inference
+  starts. For example, the DSML tool close marker starts as two tokens: `</`
+  and `｜DSML｜`.
+- `--dump-logprobs` stores a greedy continuation with the top local
+  alternatives at each step, which helps separate sampling choices from
+  logit/model issues.
+- `ds4-server --trace` writes the rendered prompts, cache decisions, generated
+  text, and tool-parser events for a whole agent session.

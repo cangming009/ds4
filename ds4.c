@@ -1170,8 +1170,11 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
 }
 
 /* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
- * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress. */
-static void model_open(ds4_model *m, const char *path, bool metal_mapping) {
+ * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
+ * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
+ * walks the huge tensor payload. */
+static void model_open(ds4_model *m, const char *path, bool metal_mapping,
+                       bool prefetch_cpu) {
     memset(m, 0, sizeof(*m));
     m->fd = -1;
 
@@ -1215,7 +1218,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping) {
     parse_metadata(m, &c);
     parse_tensors(m, &c);
 
-    if (!metal_mapping) model_prefetch_cpu_mapping(m);
+    if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
 }
 
 static void print_size(uint64_t bytes) {
@@ -13998,8 +14001,8 @@ static void tokenize_span(const ds4_vocab *vocab, const char *p, size_t n, token
     free(tmp);
 }
 
-void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
-    ds4_vocab *vocab = &e->vocab;
+static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
+                                         token_vec *out) {
     if (!text) text = "";
 
     const char *span = text;
@@ -14017,6 +14020,10 @@ void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out
         p++;
     }
     tokenize_span(vocab, span, (size_t)(p - span), out);
+}
+
+void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
+    tokenize_rendered_chat_vocab(&e->vocab, text, out);
 }
 
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
@@ -14064,20 +14071,24 @@ void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_thi
                    e->vocab.think_start_id : e->vocab.think_end_id);
 }
 
-static void dump_tokens(const ds4_vocab *vocab, const token_vec *tokens) {
-    printf("[");
+static void dump_tokens_fp(FILE *fp, const ds4_vocab *vocab, const token_vec *tokens) {
+    fprintf(fp, "[");
     for (int i = 0; i < tokens->len; i++) {
-        if (i) printf(", ");
-        printf("%d", tokens->v[i]);
+        if (i) fprintf(fp, ", ");
+        fprintf(fp, "%d", tokens->v[i]);
     }
-    printf("]\n");
+    fprintf(fp, "]\n");
 
     for (int i = 0; i < tokens->len; i++) {
         int id = tokens->v[i];
         if (id >= 0 && id < vocab->n_vocab) {
-            printf("%6d  %.*s\n", id, (int)vocab->token[id].len, vocab->token[id].ptr);
+            fprintf(fp, "%6d  %.*s\n", id, (int)vocab->token[id].len, vocab->token[id].ptr);
         }
     }
+}
+
+static void dump_tokens(const ds4_vocab *vocab, const token_vec *tokens) {
+    dump_tokens_fp(stdout, vocab, tokens);
 }
 
 static uint32_t utf8_decode_one(const char *s, uint64_t len, uint64_t *pos) {
@@ -15458,6 +15469,23 @@ void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens) {
     dump_tokens(&e->vocab, tokens);
 }
 
+int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp) {
+    ds4_model model;
+    ds4_vocab vocab;
+    token_vec tokens = {0};
+
+    if (!fp) fp = stdout;
+    model_open(&model, model_path, false, false);
+    vocab_load(&vocab, &model);
+    tokenize_rendered_chat_vocab(&vocab, text ? text : "", &tokens);
+
+    dump_tokens_fp(fp, &vocab, &tokens);
+    token_vec_free(&tokens);
+    vocab_free(&vocab);
+    model_close(&model);
+    return 0;
+}
+
 int ds4_engine_generate_argmax(
         ds4_engine        *e,
         const ds4_tokens  *prompt,
@@ -15688,13 +15716,15 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     ds4_acquire_instance_lock();
 
-    model_open(&e->model, opt->model_path, opt->backend == DS4_BACKEND_METAL);
+    model_open(&e->model, opt->model_path,
+               opt->backend == DS4_BACKEND_METAL, true);
     if (opt->warm_weights) model_warm_weights(&e->model);
     vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
     if (opt->mtp_path && opt->mtp_path[0]) {
-        model_open(&e->mtp_model, opt->mtp_path, opt->backend == DS4_BACKEND_METAL);
+        model_open(&e->mtp_model, opt->mtp_path,
+                   opt->backend == DS4_BACKEND_METAL, true);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
         fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
