@@ -4280,6 +4280,20 @@ static void append_anthropic_content(buf *b, const char *text, const char *reaso
     buf_putc(b, ']');
 }
 
+static void append_anthropic_usage_json(buf *b, const request *r,
+                                        int prompt_tokens, int completion_tokens) {
+    int cache_read_tokens = r ? r->cache_read_tokens : 0;
+    int cache_write_tokens = r ? r->cache_write_tokens : 0;
+    cache_read_tokens = clamp_usage_tokens(cache_read_tokens, prompt_tokens);
+    cache_write_tokens = clamp_usage_tokens(cache_write_tokens, prompt_tokens - cache_read_tokens);
+    int input_tokens = prompt_tokens - cache_read_tokens - cache_write_tokens;
+    if (input_tokens < 0) input_tokens = 0;
+    buf_printf(b,
+               "{\"input_tokens\":%d,\"output_tokens\":%d,"
+               "\"cache_read_input_tokens\":%d,\"cache_creation_input_tokens\":%d}",
+               input_tokens, completion_tokens, cache_read_tokens, cache_write_tokens);
+}
+
 static bool anthropic_final_response(int fd, const request *r, const char *id, const char *text,
                                      const char *reasoning, const tool_calls *calls, const char *finish,
                                      int prompt_tokens, int completion_tokens) {
@@ -4291,8 +4305,8 @@ static bool anthropic_final_response(int fd, const request *r, const char *id, c
     buf_puts(&b, ",\"stop_reason\":");
     json_escape(&b, anthropic_stop_reason(finish));
     buf_puts(&b, ",\"stop_sequence\":null,\"usage\":");
-    buf_printf(&b, "{\"input_tokens\":%d,\"output_tokens\":%d}}\n",
-               prompt_tokens, completion_tokens);
+    append_anthropic_usage_json(&b, r, prompt_tokens, completion_tokens);
+    buf_puts(&b, "}\n");
     bool ok = http_response(fd, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -4342,8 +4356,10 @@ static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
     buf_printf(&b,
         "{\"type\":\"message_start\",\"message\":{\"id\":\"%s\",\"type\":\"message\","
         "\"role\":\"assistant\",\"model\":%s,\"content\":[],\"stop_reason\":null,"
-        "\"stop_sequence\":null,\"usage\":{\"input_tokens\":%d,\"output_tokens\":0}}}",
-        id, model_json, prompt_tokens);
+        "\"stop_sequence\":null,\"usage\":",
+        id, model_json);
+    append_anthropic_usage_json(&b, r, prompt_tokens, 0);
+    buf_puts(&b, "}}");
     bool ok = sse_event(fd, "message_start", b.ptr);
     buf_free(&b);
     free(model_json);
@@ -8367,6 +8383,56 @@ static void test_anthropic_live_stream_sends_incremental_blocks(void) {
     close(sv[1]);
 }
 
+static void test_anthropic_usage_reports_cache_details(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.cache_read_tokens = 7;
+    r.cache_write_tokens = 3;
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        request_free(&r);
+        return;
+    }
+
+    TEST_ASSERT(anthropic_final_response(sv[0], &r, "msg_usage", "OK", NULL, NULL, "stop", 10, 2));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"usage\":{\"input_tokens\":0") != NULL);
+    TEST_ASSERT(strstr(out, "\"output_tokens\":2") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_read_input_tokens\":7") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_creation_input_tokens\":3") != NULL);
+
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        request_free(&r);
+        return;
+    }
+
+    anthropic_stream st;
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_usage_stream", 10, &st));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "event: message_start") != NULL);
+    TEST_ASSERT(strstr(out, "\"usage\":{\"input_tokens\":0") != NULL);
+    TEST_ASSERT(strstr(out, "\"output_tokens\":0") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_read_input_tokens\":7") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_creation_input_tokens\":3") != NULL);
+
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+    request_free(&r);
+}
+
 static void test_openai_tool_stream_sends_incremental_text(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -10313,6 +10379,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
     test_anthropic_live_stream_sends_incremental_blocks();
+    test_anthropic_usage_reports_cache_details();
     test_openai_tool_stream_sends_incremental_text();
     test_openai_stream_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
