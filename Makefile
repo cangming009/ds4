@@ -20,6 +20,10 @@ endif
 
 .PHONY: all clean test
 
+dashboard_html.h: dashboard.html
+	xxd -i $< | sed -e '1s/unsigned char/static const unsigned char/' -e '$$d' -e 's/^};$$/, 0x00/' > $@
+	echo '};' >> $@
+
 all: ds4 ds4-server
 
 ifeq ($(UNAME_S),Darwin)
@@ -48,7 +52,7 @@ ds4.o: ds4.c ds4.h ds4_metal.h
 ds4_cli.o: ds4_cli.c ds4.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
 
-ds4_server.o: ds4_server.c ds4_server_custom.c ds4.h rax.h
+ds4_server.o: ds4_server.c ds4_server_custom.c dashboard_html.h ds4.h rax.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
 
 ds4_test.o: tests/ds4_test.c ds4_server.c ds4_server_custom.c ds4.h rax.h
@@ -76,4 +80,4 @@ test: ds4_test
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4_native ds4_server_test ds4_test *.o
+	rm -f ds4 ds4-server ds4_native ds4_server_test ds4_test *.o dashboard_html.h

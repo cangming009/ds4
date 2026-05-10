@@ -13,3 +13,4 @@
 /kv-cache/
 /logs/
 /stats.ndjson
+/dashboard_html.h

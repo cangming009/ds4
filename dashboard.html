@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ds4-server Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Inter','Noto Sans SC',system-ui,-apple-system,sans-serif;background:#111;color:#e4e4e7;padding:24px 28px;font-size:14px;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+h1{color:#f4f4f5;font-size:22px;font-weight:700;display:flex;align-items:center;gap:10px;letter-spacing:-.3px}
+.top-bar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:24px}
+.tabs{display:flex;gap:3px;background:#18181b;padding:3px;border-radius:999px;border:1px solid #27272a}
+.tabs button{background:none;border:none;color:#71717a;padding:5px 16px;border-radius:999px;cursor:pointer;font-size:12px;font-weight:500;transition:all .15s;font-family:inherit}
+.tabs button.active{background:#3f3f46;color:#f4f4f5}
+.tabs button:hover{color:#f4f4f5}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-bottom:24px}
+.card{background:#18181b;border:1px solid #27272a;border-radius:12px;padding:20px}
+.card h2{font-size:10px;color:#71717a;text-transform:uppercase;letter-spacing:.8px;font-weight:600;margin-bottom:10px}
+.card .val{font-size:28px;font-weight:700;color:#f4f4f5;letter-spacing:-.5px;line-height:1.2}
+.card .sub{font-size:11px;color:#71717a;margin-top:6px}
+.card .sub .hl{color:#60a5fa}
+.cfg-grid{display:grid;grid-template-columns:auto 1fr;gap:6px 20px;font-size:13px}
+.cfg-grid dt{color:#71717a;white-space:nowrap}
+.cfg-grid dd{color:#f4f4f5;word-break:break-all}
+table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}
+th{text-align:left;padding:8px 12px;color:#71717a;border-bottom:1px solid #27272a;font-size:10px;text-transform:uppercase;letter-spacing:.5px;font-weight:600;white-space:nowrap}
+td{padding:8px 12px;border-bottom:1px solid #1c1c1f;white-space:nowrap}
+tr:hover td{background:#202024}
+.badge{display:inline-block;padding:1px 8px;border-radius:999px;font-size:10px;font-weight:600}
+.badge.ok{background:#16653444;color:#4ade80}
+.badge.warn{background:#92400e44;color:#fbbf24}
+.badge.err{background:#991b1b44;color:#f87171}
+.badge.info{background:#1e3a5f44;color:#60a5fa}
+.badge.tool{background:#5b21b644;color:#a78bfa}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e;animation:pulse 2s infinite;vertical-align:middle;margin-right:8px}
+@keyframes pulse{0%{opacity:1}50%{opacity:.4}100%{opacity:1}}
+.modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
+.modal.open{display:flex}
+.modal-box{background:#18181b;border:1px solid #27272a;border-radius:16px;padding:24px;max-width:500px;width:90%;max-height:80vh;overflow-y:auto;box-shadow:0 25px 50px -12px rgba(0,0,0,.5)}
+.modal-box h3{margin-bottom:16px;color:#f4f4f5;font-size:16px;font-weight:600}
+.modal-box .row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #27272a;font-size:13px}
+.modal-box .row .lbl{color:#71717a}
+.modal-box .row .val{color:#f4f4f5;text-align:right;font-weight:500}
+.modal-close{float:right;background:none;border:none;color:#71717a;font-size:22px;cursor:pointer;padding:0 4px;line-height:1}
+.modal-close:hover{color:#f4f4f5}
+tr{cursor:pointer}
+button.as-link{background:none;border:none;color:#60a5fa;cursor:pointer;padding:0 2px;font-size:13px;text-decoration:none;font-family:inherit}
+button.as-link:hover{color:#93c5fd}
+</style>
+</head>
+<body>
+
+<div class="top-bar">
+  <h1><span class="dot"></span>ds4-server Dashboard</h1>
+  <div class="tabs" id="range-tabs">
+    <button data-r="d1" class="active">1天</button>
+    <button data-r="d7">7天</button>
+    <button data-r="d30">30天</button>
+  </div>
+</div>
+
+<div class="grid" id="cards">
+  <div class="card">
+    <h2>请求 / Requests</h2>
+    <div class="val" id="s-req">0</div>
+    <div class="sub" id="s-req-sub"></div>
+  </div>
+  <div class="card">
+    <h2>首字时延 / TTFT</h2>
+    <div class="val" id="s-ttft">0</div>
+    <div class="sub" id="s-ttft-sub">ms</div>
+  </div>
+  <div class="card">
+    <h2>生成速度 / Speed</h2>
+    <div class="val" id="s-spd">0</div>
+    <div class="sub" id="s-spd-sub">tok/s</div>
+  </div>
+  <div class="card">
+    <h2>缓存命中 / Cache Hit</h2>
+    <div class="val" id="s-hit">0</div>
+    <div class="sub" id="s-hit-sub"></div>
+  </div>
+  <div class="card">
+    <h2>延迟 / Latency</h2>
+    <div class="val" id="s-lat">0</div>
+    <div class="sub">s / 请求</div>
+  </div>
+  <div class="card">
+    <h2>Token</h2>
+    <div class="val" id="s-tok">0</div>
+    <div class="sub" id="s-tok-d"></div>
+  </div>
+  <div class="card">
+    <h2>错误 / Errors</h2>
+    <div class="val" id="s-err">0</div>
+    <div class="sub" id="s-err-r"></div>
+  </div>
+  <div class="card">
+    <h2>显存 / Memory</h2>
+    <div class="val" id="s-mem">0</div>
+    <div class="sub">GiB</div>
+  </div>
+</div>
+
+<div class="card" style="margin-bottom:20px">
+  <h2>配置 / Configuration</h2>
+  <dl class="cfg-grid" id="cfg"></dl>
+</div>
+
+<div class="card">
+  <h2>近期请求 / Recent Requests <span id="rcnt" style="font-weight:400;font-size:11px"></span></h2>
+  <div style="overflow-x:auto">
+    <table>
+      <thead>
+        <tr>
+          <th>时间 / Time</th>
+          <th>类型 / Type</th>
+          <th>提示 / Prompt</th>
+          <th>缓存 / Cache</th>
+          <th>生成 / Gen</th>
+          <th>TTFT / ms</th>
+          <th>速度 / Spd</th>
+          <th>延迟 / Lat</th>
+          <th>结束 / End</th>
+          <th>标志 / Flag</th>
+        </tr>
+      </thead>
+      <tbody id="rt"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- request detail modal -->
+<div class="modal" id="detail-modal">
+  <div class="modal-box">
+    <button class="modal-close" onclick="closeDetail()">&times;</button>
+    <h3>请求详情 / Request Detail</h3>
+    <div id="detail-body"></div>
+  </div>
+</div>
+
+<script>
+function T(t) {
+  var d = new Date(t * 1e3);
+  return ('0' + d.getHours()).slice(-2) + ':' +
+         ('0' + d.getMinutes()).slice(-2) + ':' +
+         ('0' + d.getSeconds()).slice(-2);
+}
+function B(t, c) {
+  return '<span class="badge ' + c + '">' + t + '</span>';
+}
+var R = 'd1', _re = [];
+
+function showDetail(i) {
+  var e = _re[i];
+  if (!e) return;
+  var fb = e.er ? '错误 error' :
+           e.f === 'stop' ? '停止 stop' :
+           e.f === 'length' ? '超长 length' :
+           e.f === 'tool_calls' ? 'tool' : e.f;
+  var tp = e.k === 0 ? '聊天 / Chat' : '补全 / Completion';
+  var fl = [];
+  if (e.tl) fl.push('tools');
+  if (e.th) fl.push('思考 / Think');
+  document.getElementById('detail-body').innerHTML =
+    '<div class="row"><span class="lbl">时间 / Time</span><span class="val">' + T(e.t) + '</span></div>' +
+    '<div class="row"><span class="lbl">类型 / Type</span><span class="val">' + tp + '</span></div>' +
+    '<div class="row"><span class="lbl">提示 Token / Prompt</span><span class="val">' + e.p.toLocaleString() + '</span></div>' +
+    '<div class="row"><span class="lbl">缓存 Token / Cached</span><span class="val">' + e.c.toLocaleString() + '</span></div>' +
+    '<div class="row"><span class="lbl">生成 Token / Gen</span><span class="val">' + e.g.toLocaleString() + '</span></div>' +
+    '<div class="row"><span class="lbl">首字时延 / TTFT</span><span class="val">' + (e.ttft ? e.ttft.toFixed(1) + ' ms' : '&mdash;') + '</span></div>' +
+    '<div class="row"><span class="lbl">生成速度 / Speed</span><span class="val">' + e.s.toFixed(1) + ' tok/s</span></div>' +
+    '<div class="row"><span class="lbl">总延迟 / Latency</span><span class="val">' + (e.e ? e.e.toFixed(2) + ' s' : '&mdash;') + '</span></div>' +
+    '<div class="row"><span class="lbl">结束原因 / Finish</span><span class="val">' + fb + '</span></div>' +
+    (fl.length ? '<div class="row"><span class="lbl">标志 / Flags</span><span class="val">' + fl.join(', ') + '</span></div>' : '');
+  document.getElementById('detail-modal').classList.add('open');
+}
+function closeDetail() {
+  document.getElementById('detail-modal').classList.remove('open');
+}
+async function openCache() {
+  try { await fetch('/kv-cache/open'); } catch(e) {}
+}
+async function clearCache() {
+  if (!confirm('确定清空 KV 缓存？/ Clear KV cache?')) return;
+  try {
+    var r = await fetch('/kv-cache/clear', {method:'POST'});
+    if (r.ok) location.reload();
+    else alert('Clear failed');
+  } catch(e) { alert('Clear failed'); }
+}
+
+function updCards(r, s) {
+  document.getElementById('s-req').textContent = r.req;
+  document.getElementById('s-ttft').textContent = r.ttft.toFixed(1);
+  document.getElementById('s-ttft-sub').textContent = r.ttft.toFixed(1) + ' ms avg | all: ' + s.avg_ttft_ms.toFixed(1) + ' ms';
+  document.getElementById('s-spd').textContent = r.tps.toFixed(1);
+  document.getElementById('s-spd-sub').textContent = r.tps.toFixed(1) + ' tok/s avg | all: ' + s.avg_tokens_per_sec.toFixed(1);
+  document.getElementById('s-hit').textContent = r.hit.toFixed(1) + '%';
+  document.getElementById('s-lat').textContent = r.lat.toFixed(2);
+  var tt = s.total_prompt_tokens + s.total_gen_tokens;
+  document.getElementById('s-tok').textContent = tt.toLocaleString();
+  document.getElementById('s-tok-d').textContent = 'prompt: ' + s.total_prompt_tokens.toLocaleString() + ' | gen: ' + s.total_gen_tokens.toLocaleString();
+  document.getElementById('s-err').textContent = r.err;
+  document.getElementById('s-err-r').textContent = r.req > 0 ? r.err + ' / ' + (r.err/r.req*100).toFixed(1) + '%' : '';
+  document.getElementById('s-mem').textContent = (s.context_memory_mib / 1024).toFixed(2);
+}
+
+function update(d) {
+  var s = d.stats, c = d.config, re = d.recent || [];
+  var r = s[R];
+  if (!r) return;
+  updCards(r, s);
+
+  var h = '';
+  var p = [
+    ['模型 / Model', c.model_path],
+    ['上下文 / Context', c.ctx_size],
+    ['最大 Token / Max Tokens', c.max_tokens],
+    ['地址 / Host', c.host],
+    ['端口 / Port', c.port],
+    ['预热权重 / Warm Weights', c.warm_weights ? '✓' : '✗'],
+    ['精确内核 / Quality', c.quality ? '✓' : '✗'],
+    ['KV 缓存 / KV Cache', c.kv_cache ? '✓ (' + c.kv_cache_entries + '/' + (c.kv_cache_max_entries || '∞') + ', ' + (c.kv_cache_size_mib > 1024 ? (c.kv_cache_size_mib/1024).toFixed(1) + ' GiB' : c.kv_cache_size_mib.toFixed(0) + ' MiB') + ') <button class=as-link onclick=\'event.stopPropagation();openCache()\'>📂</button> <button class=as-link onclick=\'event.stopPropagation();clearCache()\'>🗑</button>' : '✗'],
+    ['MTP', c.mtp ? '✓' : '✗']
+  ];
+  for (var i = 0; i < p.length; i++)
+    h += '<dt>' + p[i][0] + '</dt><dd>' + p[i][1] + '</dd>';
+  document.getElementById('cfg').innerHTML = h;
+  document.getElementById('rcnt').textContent = '(' + s.ring_size + ' 条记录 shown)';
+
+  _re = re;
+  var b = '';
+  for (var i = re.length - 1; i >= 0; i--) {
+    var e = re[i];
+    var fb = e.er ? B('错误 error', 'err') :
+             e.f === 'stop' ? B('停止 stop', 'info') :
+             e.f === 'length' ? B('超长 length', 'warn') :
+             e.f === 'tool_calls' ? B('tool', 'tool') : B(e.f, 'ok');
+    var fl = '';
+    if (e.tl) fl += B('tools', 'tool') + ' ';
+    if (e.th) fl += B('思考 think', 'ok') + ' ';
+    b += '<tr onclick="showDetail(' + i + ')">' +
+         '<td>' + T(e.t) + '</td>' +
+         '<td>' + (e.k === 0 ? '聊天 chat' : '完成 cmp') + '</td>' +
+         '<td>' + e.p + '</td>' +
+         '<td>' + e.c + '</td>' +
+         '<td>' + e.g + '</td>' +
+         '<td>' + (e.ttft ? e.ttft.toFixed(0) : '—') + '</td>' +
+         '<td>' + e.s.toFixed(1) + '</td>' +
+         '<td>' + (e.e ? e.e.toFixed(2) : '—') + '</td>' +
+         '<td>' + fb + '</td>' +
+         '<td>' + fl + '</td></tr>';
+  }
+  document.getElementById('rt').innerHTML = b;
+}
+
+document.getElementById('range-tabs').addEventListener('click', function(ev) {
+  var b = ev.target.closest('button');
+  if (!b || !b.dataset.r) return;
+  R = b.dataset.r;
+  document.querySelectorAll('#range-tabs button').forEach(function(x) {
+    x.classList.toggle('active', x.dataset.r === R);
+  });
+});
+
+setInterval(async function() {
+  try {
+    var r = await fetch('/stats'), d = await r.json();
+    if (!d.stats.d1) return;
+    d.stats.context_memory_mib = d.config.context_memory_mib;
+    update(d);
+  } catch(e) {}
+}, 2000);
+</script>
+</body>
+</html>
