@@ -179,8 +179,8 @@ Anthropic endpoint streams thinking and text live, then emits structured
 DeepSeek V4 Flash emits tool calls as [DSML text](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/encoding/README.md). Agent clients do not send that
 same text back on the next request: they send normalized OpenAI/Anthropic JSON
 tool-call objects. **If the server re-rendered those objects slightly
-differently, the token prefix would no longer match the live KV checkpoint** and
-the next turn would have to be rebuilt.
+differently, the rendered byte prefix would no longer match the live KV
+checkpoint** and the next turn would have to be rebuilt.
 
 The first line of defense is exact replay. Every tool call gets an unguessable
 API tool ID, and the server remembers `tool id -> exact sampled DSML block` in
@@ -378,10 +378,11 @@ non-thinking model alias such as `deepseek-chat`.
 ## Disk KV Cache
 
 Chat/completion APIs are stateless: agent clients usually resend the whole
-conversation every request. `ds4-server` handles this by comparing the rendered
-token stream with cached token prefixes. The live in-memory checkpoint covers
-the current session; the disk KV cache makes useful prefixes survive session
-switches and server restarts.
+conversation every request. `ds4-server` first tries the cheap exact token-prefix
+check, then falls back to comparing rendered prompt bytes with decoded
+checkpoint bytes. The live in-memory checkpoint covers the current session; the
+disk KV cache makes useful prefixes survive session switches and server
+restarts.
 
 For RAM reasons there is currently only one live KV cache in memory. When a new
 unrelated session replaces it, the old checkpoint can only be resumed without
@@ -395,8 +396,12 @@ Enable it with:
 ./ds4-server --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
-The cache key is the SHA1 of exact token IDs, not raw text. Each token ID is
-hashed as a little-endian 32-bit integer, and files are named `<sha1>.kv`.
+The cache key is the SHA1 of the rendered byte prefix, and files are named
+`<sha1>.kv`. The DS4 payload still stores the exact token IDs and graph state
+for that prefix. This matters for continued chats: the model may have generated
+one token whose decoded text is later sent back by a client as two canonical
+prompt tokens. A rendered byte-prefix hit can still reuse the checkpoint and
+tokenize only the new suffix.
 The file is intentionally written with ordinary `read`/`write` I/O, not
 `mmap`, so restoring cache entries does not add more VM mappings to a process
 that already maps the model.
@@ -436,10 +441,11 @@ The fixed header is little-endian:
 ```
 
 The rendered text is the tokenizer-decoded text for the cached token prefix.
-It is stored only for observability, so humans can inspect a cache directory
-without decoding token IDs. It is not used as the key and it is not trusted
-when loading; after load, the stored checkpoint tokens must still match the
-incoming request prefix.
+It is both the human-inspectable prefix and the lookup identity: its SHA1 is
+the filename, and a file is reusable only when those bytes are a prefix of the
+incoming rendered prompt. After load, the exact checkpoint tokens from the DS4
+payload remain authoritative, and only the incoming text suffix after the cached
+bytes is tokenized.
 
 The optional tool-id map is present only when header extension bit 0 is set.
 Appended sections use fixed bit order, so future extension bits can add fields
@@ -468,7 +474,7 @@ the session payload first, then loads the map if present. Before rendering a
 request, the server can also scan cache files for the tool IDs present in the
 client history and load just those mappings, so an exact DSML replay can survive
 server restarts even when the matching KV snapshot is not the one ultimately
-used for the token-prefix hit.
+used for the rendered-prefix hit.
 
 The DS4 session payload starts with thirteen little-endian `u32` fields:
 
@@ -524,6 +530,7 @@ chunk boundary. This avoids common BPE boundary retokenization misses when a
 future request appends text to the same prompt. The defaults are conservative:
 store prefixes of at least 512 tokens, cold-save prompts up to 30000 tokens,
 trim 32 tail tokens, and align to 2048-token chunks. The important knobs are:
+
 Continued saves use the same alignment and are written only when the live graph
 naturally reaches an absolute frontier. With the defaults this means roughly
 every 10k tokens, independent of where the first cold checkpoint landed, so long
@@ -539,7 +546,7 @@ tokens.
 - `--disable-exact-dsml-tool-replay`
 
 By default, checkpoints may be reused across the 2-bit and 4-bit routed-expert
-variants if the token prefix matches. Use `--kv-cache-reject-different-quant`
+variants if the rendered prefix matches. Use `--kv-cache-reject-different-quant`
 when you want strict same-quant reuse only.
 
 The cache directory is disposable. If behavior looks suspicious, stop the
