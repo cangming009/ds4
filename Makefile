@@ -48,10 +48,10 @@ ds4.o: ds4.c ds4.h ds4_metal.h
 ds4_cli.o: ds4_cli.c ds4.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
 
-ds4_server.o: ds4_server.c ds4.h rax.h
+ds4_server.o: ds4_server.c ds4_server_custom.c ds4.h rax.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
 
-ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h rax.h
+ds4_test.o: tests/ds4_test.c ds4_server.c ds4_server_custom.c ds4.h rax.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
 
 rax.o: rax.c rax.h rax_malloc.h

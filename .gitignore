@@ -10,3 +10,6 @@
 *.dSYM/
 /misc/
 .*.swp
+/kv-cache/
+/logs/
+/stats.ndjson

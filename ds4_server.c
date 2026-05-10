@@ -4106,6 +4106,7 @@ typedef struct {
     int continued_interval_tokens;
     int boundary_trim_tokens;
     int boundary_align_tokens;
+    int max_entries;
 } kv_cache_options;
 
 typedef struct {
@@ -4179,6 +4180,7 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    void *custom_ctx;
 };
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
@@ -4192,6 +4194,17 @@ struct job {
     pthread_cond_t cv;
     job *next;
 };
+
+/* ======================== Custom hooks ======================== */
+
+static void custom_kv_cache_evict_max_entries(kv_disk_cache *kc);
+static void custom_record_stats(server *s, job *j, double ttft_ms, double t0,
+                                const char *final_finish, int cached, int completion,
+                                int thinking_inside);
+static bool custom_handle_route(server *s, int fd, void *hr);
+static void custom_server_init(server *s, const char *model_path, const char *host,
+                               int port, int ctx_size, bool warm_weights, bool quality);
+static void custom_server_close(server *s);
 
 /* =========================================================================
  * Tool Call Text Memory.
@@ -4564,6 +4577,7 @@ static void apply_openai_stream_tool_ids(tool_calls *calls,
 #define KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS 32
 #define KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS 2048
 #define KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS 10000
+#define KV_CACHE_DEFAULT_MAX_ENTRIES 10
 #define KV_CACHE_DEFAULT_MB 4096
 #define KV_EXT_TOOL_MAP (1u << 0)
 #define KV_TOOL_MAP_MAGIC0 'K'
@@ -4596,6 +4610,7 @@ static kv_cache_options kv_cache_default_options(void) {
         .continued_interval_tokens = KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS,
         .boundary_trim_tokens = KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS,
         .boundary_align_tokens = KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS,
+        .max_entries = KV_CACHE_DEFAULT_MAX_ENTRIES,
     };
 }
 
@@ -5150,37 +5165,40 @@ static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live)
 }
 
 static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live) {
-    if (!kc->enabled || kc->budget_bytes == 0) return;
+    if (!kc->enabled) return;
     kv_cache_refresh(kc);
-    uint64_t total = 0;
-    for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
-    while (total > kc->budget_bytes && kc->len > 0) {
-        int victim = 0;
-        double victim_score = kv_entry_eviction_score(&kc->entry[0], live);
-        for (int i = 1; i < kc->len; i++) {
-            double score = kv_entry_eviction_score(&kc->entry[i], live);
-            if (score < victim_score ||
-                (score == victim_score && kc->entry[i].last_used < kc->entry[victim].last_used))
-            {
-                victim = i;
-                victim_score = score;
+    if (kc->budget_bytes > 0) {
+        uint64_t total = 0;
+        for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
+        while (total > kc->budget_bytes && kc->len > 0) {
+            int victim = 0;
+            double victim_score = kv_entry_eviction_score(&kc->entry[0], live);
+            for (int i = 1; i < kc->len; i++) {
+                double score = kv_entry_eviction_score(&kc->entry[i], live);
+                if (score < victim_score ||
+                    (score == victim_score && kc->entry[i].last_used < kc->entry[victim].last_used))
+                {
+                    victim = i;
+                    victim_score = score;
+                }
             }
+            kv_entry e = kc->entry[victim];
+            if (unlink(e.path) == 0) {
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: kv cache evicted tokens=%u hits=%u size=%.2f MiB",
+                           e.tokens, e.hits, (double)e.file_size / (1024.0 * 1024.0));
+                if (total >= e.file_size) total -= e.file_size;
+                else total = 0;
+            } else {
+                total = 0;
+            }
+            kv_entry_free(&e);
+            memmove(kc->entry + victim, kc->entry + victim + 1,
+                    (size_t)(kc->len - victim - 1) * sizeof(kc->entry[0]));
+            kc->len--;
         }
-        kv_entry e = kc->entry[victim];
-        if (unlink(e.path) == 0) {
-            server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: kv cache evicted tokens=%u hits=%u size=%.2f MiB",
-                       e.tokens, e.hits, (double)e.file_size / (1024.0 * 1024.0));
-            if (total >= e.file_size) total -= e.file_size;
-            else total = 0;
-        } else {
-            total = 0;
-        }
-        kv_entry_free(&e);
-        memmove(kc->entry + victim, kc->entry + victim + 1,
-                (size_t)(kc->len - victim - 1) * sizeof(kc->entry[0]));
-        kc->len--;
     }
+    custom_kv_cache_evict_max_entries(kc);
 }
 
 static bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb,
@@ -6242,6 +6260,7 @@ static void generate_job(server *s, job *j) {
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
+    double ttft_ms = 0.0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
 
     while (!g_stop_requested && completion < max_tokens &&
@@ -6304,6 +6323,7 @@ static void generate_job(server *s, job *j) {
             size_t piece_len = 0;
             char *piece = ds4_token_text(s->engine, token, &piece_len);
             completion++;
+            if (ttft_ms == 0.0) ttft_ms = (now_sec() - t0) * 1000.0;
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
@@ -6602,7 +6622,10 @@ static void generate_job(server *s, job *j) {
     tool_calls_free(&parsed_calls);
     openai_stream_free(&openai_live);
     buf_free(&text);
+
+    custom_record_stats(s, j, ttft_ms, t0, final_finish, cached, completion, thinking.inside);
 }
+
 
 static bool enqueue(server *s, job *j) {
     pthread_mutex_lock(&s->mu);
@@ -6791,6 +6814,7 @@ static bool send_models(server *s, int fd) {
     return ok;
 }
 
+
 static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
@@ -6819,6 +6843,11 @@ static void *client_main(void *arg) {
     }
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models/deepseek-v4-flash")) {
         send_model(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+
+    if (custom_handle_route(s, fd, &hr)) {
         http_request_free(&hr);
         goto done;
     }
@@ -6990,6 +7019,7 @@ static void server_close_resources(server *s) {
         fclose(s->trace);
         s->trace = NULL;
     }
+    custom_server_close(s);
     kv_cache_close(&s->kv);
     tool_memory_free(&s->tool_mem);
     pthread_mutex_destroy(&s->tool_mu);
@@ -7057,6 +7087,8 @@ static void usage(FILE *fp) {
         "      Trim this many tail tokens before cold boundary saves to avoid tokenizer boundary merges. Default: 32\n"
         "  --kv-cache-boundary-align-tokens N\n"
         "      Align cold boundary saves down to this token multiple. 0 disables alignment. Default: 2048\n"
+        "  --kv-cache-max-entries N\n"
+        "      Max disk cache files to keep (LRU, 0=unlimited). Default: 10\n"
         "  --kv-cache-reject-different-quant\n"
         "      Refuse checkpoints written by the same model with a different routed-expert quantization.\n"
         "  --disable-exact-dsml-tool-replay\n"
@@ -7137,6 +7169,8 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache.boundary_trim_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-boundary-align-tokens")) {
             c.kv_cache.boundary_align_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-cache-max-entries")) {
+            c.kv_cache.max_entries = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-reject-different-quant")) {
             c.kv_cache_reject_different_quant = true;
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
@@ -7165,6 +7199,9 @@ static server_config parse_options(int argc, char **argv) {
     }
     return c;
 }
+
+/* ======================== Custom extensions (unity build) ======================== */
+#include "ds4_server_custom.c"
 
 #ifndef DS4_SERVER_TEST
 int main(int argc, char **argv) {
@@ -7197,6 +7234,8 @@ int main(int argc, char **argv) {
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
+    custom_server_init(&s, cfg.engine.model_path, cfg.host, cfg.port,
+                        cfg.ctx_size, cfg.engine.warm_weights, cfg.engine.quality);
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
