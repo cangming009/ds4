@@ -24,7 +24,7 @@
 #define CUDA_QK_K 256
 #define DS4_CUDA_UNUSED __attribute__((unused))
 
-struct ds4_metal_tensor {
+struct ds4_gpu_tensor {
     void *ptr;
     uint64_t bytes;
     int owner;
@@ -1035,7 +1035,7 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
     return 0;
 }
 
-extern "C" int ds4_metal_init(void) {
+extern "C" int ds4_gpu_init(void) {
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
     cudaDeviceProp prop;
@@ -1055,7 +1055,7 @@ extern "C" int ds4_metal_init(void) {
     return 1;
 }
 
-extern "C" void ds4_metal_cleanup(void) {
+extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);
@@ -1123,9 +1123,9 @@ extern "C" void ds4_metal_cleanup(void) {
     }
 }
 
-extern "C" ds4_metal_tensor *ds4_metal_tensor_alloc(uint64_t bytes) {
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
-    ds4_metal_tensor *t = (ds4_metal_tensor *)calloc(1, sizeof(*t));
+    ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
     if (!cuda_ok(cudaMallocManaged(&t->ptr, (size_t)bytes), "tensor alloc")) {
         free(t);
@@ -1136,9 +1136,9 @@ extern "C" ds4_metal_tensor *ds4_metal_tensor_alloc(uint64_t bytes) {
     return t;
 }
 
-extern "C" ds4_metal_tensor *ds4_metal_tensor_view(const ds4_metal_tensor *base, uint64_t offset, uint64_t bytes) {
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
     if (!base || offset > base->bytes || bytes > base->bytes - offset) return NULL;
-    ds4_metal_tensor *t = (ds4_metal_tensor *)calloc(1, sizeof(*t));
+    ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
     t->ptr = (char *)base->ptr + offset;
     t->bytes = bytes;
@@ -1146,34 +1146,34 @@ extern "C" ds4_metal_tensor *ds4_metal_tensor_view(const ds4_metal_tensor *base,
     return t;
 }
 
-extern "C" void ds4_metal_tensor_free(ds4_metal_tensor *tensor) {
+extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
     if (tensor->owner && tensor->ptr) (void)cudaFree(tensor->ptr);
     free(tensor);
 }
 
-extern "C" uint64_t ds4_metal_tensor_bytes(const ds4_metal_tensor *tensor) {
+extern "C" uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
     return tensor ? tensor->bytes : 0;
 }
 
-extern "C" void *ds4_metal_tensor_contents(ds4_metal_tensor *tensor) {
+extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     if (!tensor) return NULL;
     (void)cudaDeviceSynchronize();
     return tensor->ptr;
 }
 
-extern "C" int ds4_metal_tensor_write(ds4_metal_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
+extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     return cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes, cudaMemcpyHostToDevice), "tensor write");
 }
 
-extern "C" int ds4_metal_tensor_read(const ds4_metal_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
+extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
 }
 
-extern "C" int ds4_metal_tensor_copy(ds4_metal_tensor *dst, uint64_t dst_offset,
-                                     const ds4_metal_tensor *src, uint64_t src_offset,
+extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                     const ds4_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {
     if (!dst || !src || dst_offset > dst->bytes || src_offset > src->bytes ||
         bytes > dst->bytes - dst_offset || bytes > src->bytes - src_offset) {
@@ -1187,12 +1187,12 @@ extern "C" int ds4_metal_tensor_copy(ds4_metal_tensor *dst, uint64_t dst_offset,
                    "tensor copy");
 }
 
-extern "C" int ds4_metal_begin_commands(void) { return 1; }
-extern "C" int ds4_metal_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
-extern "C" int ds4_metal_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
-extern "C" int ds4_metal_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
+extern "C" int ds4_gpu_begin_commands(void) { return 1; }
+extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
+extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
+extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
-extern "C" int ds4_metal_set_model_map(const void *model_map, uint64_t model_size) {
+extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
     cuda_model_range_release_all();
@@ -1269,8 +1269,8 @@ extern "C" int ds4_metal_set_model_map(const void *model_map, uint64_t model_siz
     return 1;
 }
 
-extern "C" int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
-    if (!ds4_metal_set_model_map(model_map, model_size)) return 0;
+extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
+    if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
     if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL &&
         !cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
         (void)cuda_model_prefetch_range(model_map, model_size, map_offset, map_size);
@@ -1278,7 +1278,7 @@ extern "C" int ds4_metal_set_model_map_range(const void *model_map, uint64_t mod
     return 1;
 }
 
-extern "C" int ds4_metal_set_model_fd(int fd) {
+extern "C" int ds4_gpu_set_model_fd(int fd) {
     g_model_fd = fd;
     g_model_file_size = 0;
     if (g_model_direct_fd >= 0) {
@@ -1313,14 +1313,14 @@ extern "C" int ds4_metal_set_model_fd(int fd) {
     return 1;
 }
 
-extern "C" int ds4_metal_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
+extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
     if (!cuda_model_range_ptr(model_map, offset, bytes, label ? label : "model_tensor")) return 0;
     return cuda_model_range_is_cached(model_map, offset, bytes);
 }
 
-extern "C" int ds4_metal_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
+extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
     static int optional_q8_preload_disabled = 0;
@@ -1338,14 +1338,14 @@ extern "C" int ds4_metal_cache_q8_f16_range(const void *model_map, uint64_t mode
     return 1;
 }
 
-extern "C" void ds4_metal_print_memory_report(const char *label) {
+extern "C" void ds4_gpu_print_memory_report(const char *label) {
     size_t free_b = 0, total_b = 0;
     (void)cudaMemGetInfo(&free_b, &total_b);
     fprintf(stderr, "ds4: CUDA memory report %s: free %.2f MiB total %.2f MiB\n",
             label ? label : "", (double)free_b / 1048576.0, (double)total_b / 1048576.0);
 }
 
-extern "C" void ds4_metal_set_quality(bool quality) {
+extern "C" void ds4_gpu_set_quality(bool quality) {
     g_quality_mode = quality ? 1 : 0;
     if (g_cublas_ready) {
         const cublasMath_t math_mode =
@@ -4636,7 +4636,7 @@ __global__ static void topk_mask_kernel(float *mask, const uint32_t *topk, uint3
     mask[gid] = v;
 }
 
-extern "C" int ds4_metal_embed_token_hc_tensor(ds4_metal_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
+extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
     (void)n_vocab;
     if (!out_hc || !model_map || weight_offset >= model_size) return 0;
     uint64_t weight_bytes = (uint64_t)n_vocab * n_embd * sizeof(uint16_t);
@@ -4648,9 +4648,9 @@ extern "C" int ds4_metal_embed_token_hc_tensor(ds4_metal_tensor *out_hc, const v
     return cuda_ok(cudaGetLastError(), "embed token launch");
 }
 
-extern "C" int ds4_metal_embed_tokens_hc_tensor(
-        ds4_metal_tensor       *out_hc,
-        const ds4_metal_tensor *tokens_t,
+extern "C" int ds4_gpu_embed_tokens_hc_tensor(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *tokens_t,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
@@ -4679,10 +4679,10 @@ extern "C" int ds4_metal_embed_tokens_hc_tensor(
 }
 
 static int indexer_scores_launch(
-        ds4_metal_tensor       *scores,
-        const ds4_metal_tensor *q,
-        const ds4_metal_tensor *weights,
-        const ds4_metal_tensor *index_comp,
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -4731,11 +4731,11 @@ static int indexer_scores_launch(
     return cuda_ok(cudaGetLastError(), "indexer scores launch");
 }
 
-extern "C" int ds4_metal_indexer_score_one_tensor(
-        ds4_metal_tensor       *scores,
-        const ds4_metal_tensor *q,
-        const ds4_metal_tensor *weights,
-        const ds4_metal_tensor *index_comp,
+extern "C" int ds4_gpu_indexer_score_one_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
         uint32_t                n_comp,
         uint32_t                n_head,
         uint32_t                head_dim,
@@ -4744,11 +4744,11 @@ extern "C" int ds4_metal_indexer_score_one_tensor(
                                  n_head, head_dim, 1, scale, 0);
 }
 
-extern "C" int ds4_metal_indexer_scores_prefill_tensor(
-        ds4_metal_tensor       *scores,
-        const ds4_metal_tensor *q,
-        const ds4_metal_tensor *weights,
-        const ds4_metal_tensor *index_comp,
+extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                n_head,
@@ -4759,11 +4759,11 @@ extern "C" int ds4_metal_indexer_scores_prefill_tensor(
                                  n_head, head_dim, ratio, scale, 1);
 }
 
-extern "C" int ds4_metal_indexer_scores_decode_batch_tensor(
-        ds4_metal_tensor       *scores,
-        const ds4_metal_tensor *q,
-        const ds4_metal_tensor *weights,
-        const ds4_metal_tensor *index_comp,
+extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -4775,9 +4775,9 @@ extern "C" int ds4_metal_indexer_scores_decode_batch_tensor(
                                  n_head, head_dim, ratio, scale, 1);
 }
 
-extern "C" int ds4_metal_indexer_topk_tensor(
-        ds4_metal_tensor       *selected,
-        const ds4_metal_tensor *scores,
+extern "C" int ds4_gpu_indexer_topk_tensor(
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *scores,
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                top_k) {
@@ -4835,9 +4835,9 @@ extern "C" int ds4_metal_indexer_topk_tensor(
     return cuda_ok(cudaGetLastError(), "indexer topk launch");
 }
 
-extern "C" int ds4_metal_dsv4_topk_mask_tensor(
-        ds4_metal_tensor       *mask,
-        const ds4_metal_tensor *topk,
+extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
+        ds4_gpu_tensor       *mask,
+        const ds4_gpu_tensor *topk,
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                top_k) {
@@ -4854,7 +4854,7 @@ extern "C" int ds4_metal_dsv4_topk_mask_tensor(
                                       n_comp, n_tokens, top_k);
     return cuda_ok(cudaGetLastError(), "topk mask launch");
 }
-static int cuda_matmul_q8_0_tensor_labeled(ds4_metal_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_metal_tensor *x, uint64_t n_tok, const char *label) {
+static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map) return 0;
     uint64_t blocks = (in_dim + 31) / 32;
     if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
@@ -4963,14 +4963,14 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_metal_tensor *out, const void *mo
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 launch");
 }
 
-extern "C" int ds4_metal_matmul_q8_0_tensor(ds4_metal_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_metal_tensor *x, uint64_t n_tok) {
+extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     return cuda_matmul_q8_0_tensor_labeled(out, model_map, model_size, weight_offset,
                                            in_dim, out_dim, x, n_tok, "q8_0");
 }
 
-extern "C" int ds4_metal_matmul_q8_0_pair_tensor(
-        ds4_metal_tensor *out0,
-        ds4_metal_tensor *out1,
+extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
+        ds4_gpu_tensor *out0,
+        ds4_gpu_tensor *out1,
         const void *model_map,
         uint64_t model_size,
         uint64_t weight0_offset,
@@ -4978,7 +4978,7 @@ extern "C" int ds4_metal_matmul_q8_0_pair_tensor(
         uint64_t in_dim,
         uint64_t out0_dim,
         uint64_t out1_dim,
-        const ds4_metal_tensor *x,
+        const ds4_gpu_tensor *x,
         uint64_t n_tok) {
     if (!out0 || !out1 || !x || !model_map || in_dim == 0 || out0_dim == 0 || out1_dim == 0 || n_tok == 0) {
         return 0;
@@ -5036,17 +5036,17 @@ extern "C" int ds4_metal_matmul_q8_0_pair_tensor(
 }
 
 static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
-        ds4_metal_tensor       *out_hc,
-        ds4_metal_tensor       *block_out,
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_metal_tensor *x,
-        const ds4_metal_tensor *block_add,
-        const ds4_metal_tensor *residual_hc,
-        const ds4_metal_tensor *split,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc,
         const char             *label) {
@@ -5101,7 +5101,7 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand launch");
 }
 
-extern "C" int ds4_metal_matmul_f16_tensor(ds4_metal_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_metal_tensor *x, uint64_t n_tok) {
+extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
     uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
@@ -5164,16 +5164,16 @@ extern "C" int ds4_metal_matmul_f16_tensor(ds4_metal_tensor *out, const void *mo
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
 }
 
-extern "C" int ds4_metal_matmul_f16_pair_tensor(
-        ds4_metal_tensor *out0,
-        ds4_metal_tensor *out1,
+extern "C" int ds4_gpu_matmul_f16_pair_tensor(
+        ds4_gpu_tensor *out0,
+        ds4_gpu_tensor *out1,
         const void *model_map,
         uint64_t model_size,
         uint64_t weight0_offset,
         uint64_t weight1_offset,
         uint64_t in_dim,
         uint64_t out_dim,
-        const ds4_metal_tensor *x,
+        const ds4_gpu_tensor *x,
         uint64_t n_tok) {
     if (!out0 || !out1 || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) {
         return 0;
@@ -5183,9 +5183,9 @@ extern "C" int ds4_metal_matmul_f16_pair_tensor(
         getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
         getenv("DS4_CUDA_SERIAL_ROUTER") != NULL ||
         getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL) {
-        return ds4_metal_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
+        return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
                                            in_dim, out_dim, x, n_tok) &&
-               ds4_metal_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
+               ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
                                            in_dim, out_dim, x, n_tok);
     }
     if (weight0_offset > model_size || weight1_offset > model_size ||
@@ -5215,7 +5215,7 @@ extern "C" int ds4_metal_matmul_f16_pair_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks launch");
 }
 
-extern "C" int ds4_metal_matmul_f32_tensor(ds4_metal_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_metal_tensor *x, uint64_t n_tok) {
+extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
     uint64_t weight_elems = out_dim * in_dim;
@@ -5251,7 +5251,7 @@ extern "C" int ds4_metal_matmul_f32_tensor(ds4_metal_tensor *out, const void *mo
     return cuda_ok(cudaGetLastError(), "matmul_f32 launch");
 }
 
-extern "C" int ds4_metal_repeat_hc_tensor(ds4_metal_tensor *out, const ds4_metal_tensor *row, uint32_t n_embd, uint32_t n_hc) {
+extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *row, uint32_t n_embd, uint32_t n_hc) {
     if (!out || !row || n_embd == 0 || n_hc == 0 ||
         row->bytes < (uint64_t)n_embd * sizeof(float) ||
         out->bytes < (uint64_t)n_embd * n_hc * sizeof(float)) {
@@ -5262,19 +5262,19 @@ extern "C" int ds4_metal_repeat_hc_tensor(ds4_metal_tensor *out, const ds4_metal
     return cuda_ok(cudaGetLastError(), "repeat_hc launch");
 }
 
-extern "C" int ds4_metal_rms_norm_plain_tensor(ds4_metal_tensor *out, const ds4_metal_tensor *x, uint32_t n, float eps) {
+extern "C" int ds4_gpu_rms_norm_plain_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, float eps) {
     if (!out || !x || out->bytes < (uint64_t)n * sizeof(float) ||
         x->bytes < (uint64_t)n * sizeof(float)) return 0;
     rms_norm_plain_kernel<<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, n, 1, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_plain launch");
 }
-extern "C" int ds4_metal_rms_norm_plain_rows_tensor(ds4_metal_tensor *out, const ds4_metal_tensor *x, uint32_t n, uint32_t rows, float eps) {
+extern "C" int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, uint32_t rows, float eps) {
     if (!out || !x || out->bytes < (uint64_t)n * rows * sizeof(float) ||
         x->bytes < (uint64_t)n * rows * sizeof(float)) return 0;
     rms_norm_plain_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_plain launch");
 }
-extern "C" int ds4_metal_rms_norm_weight_tensor(ds4_metal_tensor *out, const ds4_metal_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps) {
+extern "C" int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps) {
     if (!out || !x || !model_map || weight_offset > model_size ||
         model_size - weight_offset < (uint64_t)n * sizeof(float) ||
         out->bytes < (uint64_t)n * sizeof(float) ||
@@ -5285,7 +5285,7 @@ extern "C" int ds4_metal_rms_norm_weight_tensor(ds4_metal_tensor *out, const ds4
     rms_norm_weight_kernel<<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
-extern "C" int ds4_metal_rms_norm_weight_rows_tensor(ds4_metal_tensor *out, const ds4_metal_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
+extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
     if (!out || !x || !model_map || weight_offset > model_size ||
         model_size - weight_offset < (uint64_t)n * sizeof(float) ||
         out->bytes < (uint64_t)n * rows * sizeof(float) ||
@@ -5296,15 +5296,15 @@ extern "C" int ds4_metal_rms_norm_weight_rows_tensor(ds4_metal_tensor *out, cons
     rms_norm_weight_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
-extern "C" int ds4_metal_dsv4_qkv_rms_norm_rows_tensor(
-        ds4_metal_tensor       *q_out,
-        const ds4_metal_tensor *q,
+extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
+        ds4_gpu_tensor       *q_out,
+        const ds4_gpu_tensor *q,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                q_weight_offset,
         uint32_t                q_n,
-        ds4_metal_tensor       *kv_out,
-        const ds4_metal_tensor *kv,
+        ds4_gpu_tensor       *kv_out,
+        const ds4_gpu_tensor *kv,
         uint64_t                kv_weight_offset,
         uint32_t                kv_n,
         uint32_t                rows,
@@ -5340,52 +5340,52 @@ extern "C" int ds4_metal_dsv4_qkv_rms_norm_rows_tensor(
                 eps);
         return cuda_ok(cudaGetLastError(), "dsv4 qkv rms norm rows launch");
     }
-    return ds4_metal_rms_norm_weight_rows_tensor(q_out, q, model_map, model_size,
+    return ds4_gpu_rms_norm_weight_rows_tensor(q_out, q, model_map, model_size,
                                                  q_weight_offset, q_n, rows, eps) &&
-           ds4_metal_rms_norm_weight_rows_tensor(kv_out, kv, model_map, model_size,
+           ds4_gpu_rms_norm_weight_rows_tensor(kv_out, kv, model_map, model_size,
                                                  kv_weight_offset, kv_n, rows, eps);
 }
-extern "C" int ds4_metal_head_rms_norm_tensor(ds4_metal_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, float eps) {
+extern "C" int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, float eps) {
     if (!x || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
     head_rms_norm_kernel<<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, eps);
     return cuda_ok(cudaGetLastError(), "head_rms_norm launch");
 }
-extern "C" int ds4_metal_head_rms_norm_rope_tail_tensor(ds4_metal_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps) {
+extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps) {
     if (!x || n_rot > head_dim || (n_rot & 1u) ||
         x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
     head_rms_norm_rope_tail_kernel<<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
     return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail launch");
 }
-extern "C" int ds4_metal_dsv4_fp8_kv_quantize_tensor(ds4_metal_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
+extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
     if (!x || n_rot > head_dim || x->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
     fp8_kv_quantize_kernel<<<n_tok, 64>>>((float *)x->ptr, n_tok, head_dim, n_rot);
     return cuda_ok(cudaGetLastError(), "fp8_kv_quantize launch");
 }
-extern "C" int ds4_metal_rope_tail_tensor(ds4_metal_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
+extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
     if (!x || n_rot > head_dim || (n_rot & 1) || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
     uint32_t pairs = n_tok * n_head * (n_rot / 2);
     rope_tail_kernel<<<(pairs + 255) / 256, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
     return cuda_ok(cudaGetLastError(), "rope_tail launch");
 }
-extern "C" int ds4_metal_store_raw_kv_tensor(ds4_metal_tensor *raw_cache, const ds4_metal_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim);
-extern "C" int ds4_metal_kv_fp8_store_raw_tensor(
-        ds4_metal_tensor *kv,
-        ds4_metal_tensor *raw_cache,
+extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim);
+extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
+        ds4_gpu_tensor *kv,
+        ds4_gpu_tensor *raw_cache,
         uint32_t          raw_cap,
         uint32_t          raw_row,
         uint32_t          head_dim,
         uint32_t          n_rot) {
-    return ds4_metal_dsv4_fp8_kv_quantize_tensor(kv, 1, head_dim, n_rot) &&
-           ds4_metal_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, head_dim);
+    return ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, head_dim, n_rot) &&
+           ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, head_dim);
 }
-extern "C" int ds4_metal_store_raw_kv_tensor(ds4_metal_tensor *raw_cache, const ds4_metal_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim) {
+extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim) {
     if (!raw_cache || !kv || raw_cap == 0 ||
         raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
         kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
     store_raw_kv_batch_kernel<<<(head_dim + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, row, 1, head_dim);
     return cuda_ok(cudaGetLastError(), "store_raw_kv launch");
 }
-extern "C" int ds4_metal_store_raw_kv_batch_tensor(ds4_metal_tensor *raw_cache, const ds4_metal_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
+extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
     if (!raw_cache || !kv || raw_cap == 0 ||
         raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
         kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
@@ -5393,11 +5393,11 @@ extern "C" int ds4_metal_store_raw_kv_batch_tensor(ds4_metal_tensor *raw_cache, 
     store_raw_kv_batch_kernel<<<(n + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim);
     return cuda_ok(cudaGetLastError(), "store_raw_kv_batch launch");
 }
-extern "C" int ds4_metal_compressor_store_batch_tensor(
-        const ds4_metal_tensor *kv,
-        const ds4_metal_tensor *sc,
-        ds4_metal_tensor       *state_kv,
-        ds4_metal_tensor       *state_score,
+extern "C" int ds4_gpu_compressor_store_batch_tensor(
+        const ds4_gpu_tensor *kv,
+        const ds4_gpu_tensor *sc,
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                ape_offset,
@@ -5441,12 +5441,12 @@ extern "C" int ds4_metal_compressor_store_batch_tensor(
     return cuda_ok(cudaGetLastError(), "compressor store launch");
 }
 
-extern "C" int ds4_metal_compressor_update_tensor(
-        const ds4_metal_tensor *kv_cur,
-        const ds4_metal_tensor *sc_cur,
-        ds4_metal_tensor       *state_kv,
-        ds4_metal_tensor       *state_score,
-        ds4_metal_tensor       *comp_cache,
+extern "C" int ds4_gpu_compressor_update_tensor(
+        const ds4_gpu_tensor *kv_cur,
+        const ds4_gpu_tensor *sc_cur,
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        ds4_gpu_tensor       *comp_cache,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                ape_offset,
@@ -5489,13 +5489,13 @@ extern "C" int ds4_metal_compressor_update_tensor(
         (emit && comp_cache->bytes < comp_bytes)) {
         return 0;
     }
-    if (!ds4_metal_compressor_store_batch_tensor(kv_cur, sc_cur, state_kv, state_score,
+    if (!ds4_gpu_compressor_store_batch_tensor(kv_cur, sc_cur, state_kv, state_score,
                                                  model_map, model_size, ape_offset, ape_type,
                                                  head_dim, ratio, pos, 1)) {
         return 0;
     }
     if (!emit) return 1;
-    ds4_metal_tensor *comp_row_view = ds4_metal_tensor_view(
+    ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(
             comp_cache,
             (uint64_t)comp_row * head_dim * sizeof(float),
             (uint64_t)head_dim * sizeof(float));
@@ -5507,14 +5507,14 @@ extern "C" int ds4_metal_compressor_update_tensor(
             head_dim,
             ratio);
     int ok = cuda_ok(cudaGetLastError(), "compressor update pool launch");
-    if (ok) ok = ds4_metal_rms_norm_weight_rows_tensor(comp_row_view, comp_row_view,
+    if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(comp_row_view, comp_row_view,
                                                        model_map, model_size, norm_offset,
                                                        head_dim, 1, rms_eps);
-    if (ok) ok = ds4_metal_rope_tail_tensor(comp_row_view, 1, 1, head_dim, n_rot,
+    if (ok) ok = ds4_gpu_rope_tail_tensor(comp_row_view, 1, 1, head_dim, n_rot,
                                             pos + 1u - ratio, n_ctx_orig, false,
                                             freq_base, freq_scale, ext_factor, attn_factor,
                                             beta_fast, beta_slow);
-    ds4_metal_tensor_free(comp_row_view);
+    ds4_gpu_tensor_free(comp_row_view);
     if (ok && ratio == 4u) {
         uint64_t half = 4ull * width;
         compressor_shift_ratio4_kernel<<<(half + 255) / 256, 256>>>(
@@ -5523,12 +5523,12 @@ extern "C" int ds4_metal_compressor_update_tensor(
     }
     return ok;
 }
-extern "C" int ds4_metal_compressor_prefill_tensor(
-        ds4_metal_tensor       *comp_cache,
-        ds4_metal_tensor       *state_kv,
-        ds4_metal_tensor       *state_score,
-        const ds4_metal_tensor *kv,
-        const ds4_metal_tensor *sc,
+extern "C" int ds4_gpu_compressor_prefill_tensor(
+        ds4_gpu_tensor       *comp_cache,
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        const ds4_gpu_tensor *kv,
+        const ds4_gpu_tensor *sc,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                ape_offset,
@@ -5624,23 +5624,23 @@ extern "C" int ds4_metal_compressor_prefill_tensor(
                 (const float *)state_score->ptr,
                 ape, 0, ape_type, head_dim, ratio, pos0, n_comp, 0);
         if (!cuda_ok(cudaGetLastError(), "compressor prefill pool launch")) return 0;
-        if (!ds4_metal_rms_norm_weight_rows_tensor(comp_cache, comp_cache,
+        if (!ds4_gpu_rms_norm_weight_rows_tensor(comp_cache, comp_cache,
                                                    model_map, model_size, norm_offset,
                                                    head_dim, n_comp, rms_eps)) return 0;
-        if (n_rot != 0 && !ds4_metal_rope_tail_tensor(comp_cache, n_comp, 1, head_dim,
+        if (n_rot != 0 && !ds4_gpu_rope_tail_tensor(comp_cache, n_comp, 1, head_dim,
                                                       n_rot, pos0, n_ctx_orig, false,
                                                       freq_base, freq_scale, ext_factor,
                                                       attn_factor, beta_fast, beta_slow)) return 0;
-        if (quantize_fp8 && !ds4_metal_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot)) return 0;
+        if (quantize_fp8 && !ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot)) return 0;
     }
     return 1;
 }
-extern "C" int ds4_metal_compressor_prefill_ratio4_replay_tensor(
-        ds4_metal_tensor       *comp_cache,
-        ds4_metal_tensor       *state_kv,
-        ds4_metal_tensor       *state_score,
-        const ds4_metal_tensor *kv,
-        const ds4_metal_tensor *sc,
+extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
+        ds4_gpu_tensor       *comp_cache,
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        const ds4_gpu_tensor *kv,
+        const ds4_gpu_tensor *sc,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                ape_offset,
@@ -5695,14 +5695,14 @@ extern "C" int ds4_metal_compressor_prefill_ratio4_replay_tensor(
             (const float *)state_score->ptr,
             ape, 0, ape_type, head_dim, ratio, pos0, n_comp, 1);
     if (!cuda_ok(cudaGetLastError(), "compressor replay pool launch")) return 0;
-    if (!ds4_metal_rms_norm_weight_rows_tensor(comp_cache, comp_cache,
+    if (!ds4_gpu_rms_norm_weight_rows_tensor(comp_cache, comp_cache,
                                                model_map, model_size, norm_offset,
                                                head_dim, n_comp, rms_eps)) return 0;
-    if (n_rot != 0 && !ds4_metal_rope_tail_tensor(comp_cache, n_comp, 1, head_dim,
+    if (n_rot != 0 && !ds4_gpu_rope_tail_tensor(comp_cache, n_comp, 1, head_dim,
                                                   n_rot, pos0, n_ctx_orig, false,
                                                   freq_base, freq_scale, ext_factor,
                                                   attn_factor, beta_fast, beta_slow)) return 0;
-    if (quantize_fp8 && !ds4_metal_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot)) return 0;
+    if (quantize_fp8 && !ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot)) return 0;
 
     uint64_t state_n = (uint64_t)state_rows * width;
     fill_f32_kernel<<<(state_n + 255) / 256, 256>>>((float *)state_kv->ptr, state_n, 0.0f);
@@ -5718,11 +5718,11 @@ extern "C" int ds4_metal_compressor_prefill_ratio4_replay_tensor(
             prev_start, 0, ratio);
     return cuda_ok(cudaGetLastError(), "compressor replay state launch");
 }
-extern "C" int ds4_metal_compressor_prefill_state_ratio4_tensor(
-        ds4_metal_tensor       *state_kv,
-        ds4_metal_tensor       *state_score,
-        const ds4_metal_tensor *kv_tail,
-        const ds4_metal_tensor *sc_tail,
+extern "C" int ds4_gpu_compressor_prefill_state_ratio4_tensor(
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        const ds4_gpu_tensor *kv_tail,
+        const ds4_gpu_tensor *sc_tail,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                ape_offset,
@@ -5760,19 +5760,19 @@ extern "C" int ds4_metal_compressor_prefill_state_ratio4_tensor(
             0, 0, ratio);
     return cuda_ok(cudaGetLastError(), "compressor state set launch");
 }
-extern "C" int ds4_metal_attention_decode_heads_tensor(
-        ds4_metal_tensor       *heads,
+extern "C" int ds4_gpu_attention_decode_heads_tensor(
+        ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_metal_tensor *q,
-        const ds4_metal_tensor *raw_kv,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
         uint32_t                n_raw,
         uint32_t                raw_cap,
         uint32_t                raw_start,
-        const ds4_metal_tensor *comp_kv,
+        const ds4_gpu_tensor *comp_kv,
         uint32_t                n_comp,
-        const ds4_metal_tensor *comp_mask,
+        const ds4_gpu_tensor *comp_mask,
         uint32_t                use_mask,
         uint32_t                n_head,
         uint32_t                head_dim) {
@@ -5802,7 +5802,7 @@ extern "C" int ds4_metal_attention_decode_heads_tensor(
                                                  0, 0, n_head, head_dim);
     return cuda_ok(cudaGetLastError(), "attention decode launch");
 }
-extern "C" int ds4_metal_attention_prefill_raw_heads_tensor(ds4_metal_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_metal_tensor *q, const ds4_metal_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {
+extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {
     if (!heads || !q || !raw_kv || !model_map || sinks_offset > model_size ||
         model_size - sinks_offset < (uint64_t)n_head * sizeof(float) ||
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
@@ -5902,14 +5902,14 @@ extern "C" int ds4_metal_attention_prefill_raw_heads_tensor(ds4_metal_tensor *he
     return cuda_ok(cudaGetLastError(), "attention_prefill_raw launch");
 }
 static int attention_decode_batch_launch(
-        ds4_metal_tensor       *heads,
+        ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_metal_tensor *q,
-        const ds4_metal_tensor *raw_kv,
-        const ds4_metal_tensor *comp_kv,
-        const ds4_metal_tensor *comp_mask,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        const ds4_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -5970,13 +5970,13 @@ static int attention_decode_batch_launch(
     return cuda_ok(cudaGetLastError(), "attention decode batch launch");
 }
 
-extern "C" int ds4_metal_attention_decode_raw_batch_heads_tensor(
-        ds4_metal_tensor       *heads,
+extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
+        ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_metal_tensor *q,
-        const ds4_metal_tensor *raw_kv,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
         uint32_t                n_tokens,
         uint32_t                pos0,
         uint32_t                n_raw,
@@ -5991,15 +5991,15 @@ extern "C" int ds4_metal_attention_decode_raw_batch_heads_tensor(
                                       n_head, head_dim);
 }
 
-extern "C" int ds4_metal_attention_decode_mixed_batch_heads_tensor(
-        ds4_metal_tensor       *heads,
+extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
+        ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_metal_tensor *q,
-        const ds4_metal_tensor *raw_kv,
-        const ds4_metal_tensor *comp_kv,
-        const ds4_metal_tensor *comp_mask,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        const ds4_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -6017,15 +6017,15 @@ extern "C" int ds4_metal_attention_decode_mixed_batch_heads_tensor(
                                       n_comp, window, ratio, n_head, head_dim);
 }
 
-extern "C" int ds4_metal_attention_indexed_mixed_batch_heads_tensor(
-        ds4_metal_tensor       *heads,
+extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+        ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_metal_tensor *q,
-        const ds4_metal_tensor *raw_kv,
-        const ds4_metal_tensor *comp_kv,
-        const ds4_metal_tensor *topk,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        const ds4_gpu_tensor *topk,
         uint32_t                n_tokens,
         uint32_t                pos0,
         uint32_t                n_raw,
@@ -6117,14 +6117,14 @@ extern "C" int ds4_metal_attention_indexed_mixed_batch_heads_tensor(
 }
 
 static int attention_prefill_mixed_launch(
-        ds4_metal_tensor       *heads,
+        ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_metal_tensor *q,
-        const ds4_metal_tensor *raw_kv,
-        const ds4_metal_tensor *comp_kv,
-        const ds4_metal_tensor *comp_mask,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        const ds4_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
         uint32_t                n_comp,
@@ -6260,14 +6260,14 @@ static int attention_prefill_mixed_launch(
     return cuda_ok(cudaGetLastError(), "attention prefill mixed launch");
 }
 
-extern "C" int ds4_metal_attention_prefill_static_mixed_heads_tensor(
-        ds4_metal_tensor       *heads,
+extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+        ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_metal_tensor *q,
-        const ds4_metal_tensor *raw_kv,
-        const ds4_metal_tensor *comp_kv,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
         uint32_t                n_tokens,
         uint32_t                n_comp,
         uint32_t                window,
@@ -6279,15 +6279,15 @@ extern "C" int ds4_metal_attention_prefill_static_mixed_heads_tensor(
                                        n_comp, window, ratio, n_head, head_dim);
 }
 
-extern "C" int ds4_metal_attention_prefill_masked_mixed_heads_tensor(
-        ds4_metal_tensor       *heads,
+extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
+        ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                sinks_offset,
-        const ds4_metal_tensor *q,
-        const ds4_metal_tensor *raw_kv,
-        const ds4_metal_tensor *comp_kv,
-        const ds4_metal_tensor *comp_mask,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        const ds4_gpu_tensor *comp_mask,
         uint32_t                n_tokens,
         uint32_t                n_comp,
         uint32_t                window,
@@ -6298,11 +6298,11 @@ extern "C" int ds4_metal_attention_prefill_masked_mixed_heads_tensor(
                                        q, raw_kv, comp_kv, comp_mask, 1, n_tokens,
                                        n_comp, window, ratio, n_head, head_dim);
 }
-extern "C" int ds4_metal_attention_output_q8_batch_tensor(
-        ds4_metal_tensor       *out,
-        ds4_metal_tensor       *low,
-        ds4_metal_tensor       *group_tmp,
-        ds4_metal_tensor       *low_tmp,
+extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                out_a_offset,
@@ -6311,7 +6311,7 @@ extern "C" int ds4_metal_attention_output_q8_batch_tensor(
         uint64_t                rank,
         uint32_t                n_groups,
         uint64_t                out_dim,
-        const ds4_metal_tensor *heads,
+        const ds4_gpu_tensor *heads,
         uint32_t                n_tokens) {
     (void)group_tmp;
     (void)low_tmp;
@@ -6444,15 +6444,15 @@ extern "C" int ds4_metal_attention_output_q8_batch_tensor(
                                            n_tokens,
                                            "attn_output_b");
 }
-extern "C" int ds4_metal_attention_output_low_q8_tensor(
-        ds4_metal_tensor       *low,
+extern "C" int ds4_gpu_attention_output_low_q8_tensor(
+        ds4_gpu_tensor       *low,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                out_a_offset,
         uint64_t                group_dim,
         uint64_t                rank,
         uint32_t                n_groups,
-        const ds4_metal_tensor *heads) {
+        const ds4_gpu_tensor *heads) {
     if (!low || !heads || !model_map || group_dim == 0 || rank == 0 || n_groups == 0) {
         return 0;
     }
@@ -6498,7 +6498,7 @@ extern "C" int ds4_metal_attention_output_low_q8_tensor(
                                                       use_dp4a);
     return cuda_ok(cudaGetLastError(), "attention_output_low_q8 launch");
 }
-extern "C" int ds4_metal_swiglu_tensor(ds4_metal_tensor *out, const ds4_metal_tensor *gate, const ds4_metal_tensor *up, uint32_t n, float clamp, float weight) {
+extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight) {
     if (!out || !gate || !up ||
         out->bytes < (uint64_t)n * sizeof(float) ||
         gate->bytes < (uint64_t)n * sizeof(float) ||
@@ -6506,32 +6506,32 @@ extern "C" int ds4_metal_swiglu_tensor(ds4_metal_tensor *out, const ds4_metal_te
     swiglu_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight);
     return cuda_ok(cudaGetLastError(), "swiglu launch");
 }
-extern "C" int ds4_metal_shared_gate_up_swiglu_q8_0_tensor(
-        ds4_metal_tensor       *gate,
-        ds4_metal_tensor       *up,
-        ds4_metal_tensor       *mid,
+extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                gate_offset,
         uint64_t                up_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_metal_tensor *x) {
+        const ds4_gpu_tensor *x) {
     if (getenv("DS4_CUDA_DISABLE_SHARED_GATE_UP_PAIR") == NULL) {
-        return ds4_metal_matmul_q8_0_pair_tensor(gate, up,
+        return ds4_gpu_matmul_q8_0_pair_tensor(gate, up,
                                                  model_map, model_size,
                                                  gate_offset, up_offset,
                                                  in_dim, out_dim, out_dim,
                                                  x, 1) &&
-               ds4_metal_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, 10.0f, 1.0f);
+               ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, 10.0f, 1.0f);
     }
-    return ds4_metal_matmul_q8_0_tensor(gate, model_map, model_size,
+    return ds4_gpu_matmul_q8_0_tensor(gate, model_map, model_size,
                                         gate_offset, in_dim, out_dim, x, 1) &&
-           ds4_metal_matmul_q8_0_tensor(up, model_map, model_size,
+           ds4_gpu_matmul_q8_0_tensor(up, model_map, model_size,
                                         up_offset, in_dim, out_dim, x, 1) &&
-           ds4_metal_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, 10.0f, 1.0f);
+           ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, 10.0f, 1.0f);
 }
-extern "C" int ds4_metal_add_tensor(ds4_metal_tensor *out, const ds4_metal_tensor *a, const ds4_metal_tensor *b, uint32_t n) {
+extern "C" int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t n) {
     if (!out || !a || !b ||
         out->bytes < (uint64_t)n * sizeof(float) ||
         a->bytes < (uint64_t)n * sizeof(float) ||
@@ -6539,9 +6539,9 @@ extern "C" int ds4_metal_add_tensor(ds4_metal_tensor *out, const ds4_metal_tenso
     add_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)a->ptr, (const float *)b->ptr, n);
     return cuda_ok(cudaGetLastError(), "add launch");
 }
-extern "C" int ds4_metal_directional_steering_project_tensor(
-        ds4_metal_tensor       *x,
-        const ds4_metal_tensor *directions,
+extern "C" int ds4_gpu_directional_steering_project_tensor(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *directions,
         uint32_t                layer,
         uint32_t                width,
         uint32_t                rows,
@@ -6562,7 +6562,7 @@ extern "C" int ds4_metal_directional_steering_project_tensor(
             scale);
     return cuda_ok(cudaGetLastError(), "directional steering launch");
 }
-extern "C" int ds4_metal_router_select_tensor(ds4_metal_tensor *selected, ds4_metal_tensor *weights, ds4_metal_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_metal_tensor *logits) {
+extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits) {
     if (!selected || !weights || !probs || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u) return 0;
     int32_t tok = (int32_t)token;
     int ok = 1;
@@ -6599,7 +6599,7 @@ extern "C" int ds4_metal_router_select_tensor(ds4_metal_tensor *selected, ds4_me
     }
     return ok;
 }
-extern "C" int ds4_metal_router_select_batch_tensor(ds4_metal_tensor *selected, ds4_metal_tensor *weights, ds4_metal_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_metal_tensor *logits, const ds4_metal_tensor *tokens, uint32_t n_tokens) {
+extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t n_tokens) {
     if (!selected || !weights || !probs || !logits || !tokens || !model_map || n_tokens == 0 ||
         n_expert_groups > 1u || n_group_used > 0u ||
         logits->bytes < (uint64_t)n_tokens * 256u * sizeof(float) ||
@@ -8807,11 +8807,11 @@ __global__ static void moe_down_f32_kernel(
 }
 
 static int routed_moe_launch(
-        ds4_metal_tensor *out,
-        ds4_metal_tensor *gate,
-        ds4_metal_tensor *up,
-        ds4_metal_tensor *mid,
-        ds4_metal_tensor *down,
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down,
         const void *model_map,
         uint64_t model_size,
         uint64_t gate_offset,
@@ -8826,11 +8826,11 @@ static int routed_moe_launch(
         uint32_t expert_in_dim,
         uint32_t expert_mid_dim,
         uint32_t out_dim,
-        const ds4_metal_tensor *selected,
-        const ds4_metal_tensor *weights,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
         uint32_t n_expert,
         float clamp,
-        const ds4_metal_tensor *x,
+        const ds4_gpu_tensor *x,
         uint32_t n_tokens) {
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_expert == 0 ||
@@ -9357,7 +9357,7 @@ static int routed_moe_launch(
     return ok;
 }
 
-extern "C" int ds4_metal_routed_moe_one_tensor(ds4_metal_tensor *out, ds4_metal_tensor *gate, ds4_metal_tensor *up, ds4_metal_tensor *mid, ds4_metal_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_metal_tensor *selected, const ds4_metal_tensor *weights, uint32_t n_expert, float clamp, const ds4_metal_tensor *x) {
+extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x) {
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,
@@ -9366,7 +9366,7 @@ extern "C" int ds4_metal_routed_moe_one_tensor(ds4_metal_tensor *out, ds4_metal_
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_expert, clamp, x, 1);
 }
-extern "C" int ds4_metal_routed_moe_batch_tensor(ds4_metal_tensor *out, ds4_metal_tensor *gate, ds4_metal_tensor *up, ds4_metal_tensor *mid, ds4_metal_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_metal_tensor *selected, const ds4_metal_tensor *weights, uint32_t n_expert, float clamp, const ds4_metal_tensor *x, uint32_t n_tokens) {
+extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t n_tokens) {
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,
@@ -9375,7 +9375,7 @@ extern "C" int ds4_metal_routed_moe_batch_tensor(ds4_metal_tensor *out, ds4_meta
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_expert, clamp, x, n_tokens);
 }
-extern "C" int ds4_metal_hc_split_sinkhorn_tensor(ds4_metal_tensor *out, const ds4_metal_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
+extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;
     const uint64_t mix_bytes = 24ull * sizeof(float);
     if (scale_offset > model_size || model_size - scale_offset < 3ull * sizeof(float) ||
@@ -9393,7 +9393,7 @@ extern "C" int ds4_metal_hc_split_sinkhorn_tensor(ds4_metal_tensor *out, const d
         n_rows, sinkhorn_iters, eps);
     return cuda_ok(cudaGetLastError(), "hc_split_sinkhorn launch");
 }
-extern "C" int ds4_metal_hc_weighted_sum_tensor(ds4_metal_tensor *out, const ds4_metal_tensor *residual_hc, const ds4_metal_tensor *weights, uint32_t n_embd, uint32_t n_hc) {
+extern "C" int ds4_gpu_hc_weighted_sum_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *weights, uint32_t n_embd, uint32_t n_hc) {
     if (!out || !residual_hc || !weights || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out->bytes / ((uint64_t)n_embd * sizeof(float)));
     hc_weighted_sum_kernel<<<((uint64_t)n_embd * n_tokens + 255) / 256, 256>>>(
@@ -9401,7 +9401,7 @@ extern "C" int ds4_metal_hc_weighted_sum_tensor(ds4_metal_tensor *out, const ds4
         n_embd, n_hc, n_tokens, n_hc);
     return cuda_ok(cudaGetLastError(), "hc_weighted_sum launch");
 }
-extern "C" int ds4_metal_hc_weighted_sum_split_tensor(ds4_metal_tensor *out, const ds4_metal_tensor *residual_hc, const ds4_metal_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+extern "C" int ds4_gpu_hc_weighted_sum_split_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out->bytes / ((uint64_t)n_embd * sizeof(float)));
     uint32_t stride = (uint32_t)(2u * n_hc + n_hc * n_hc);
@@ -9410,11 +9410,11 @@ extern "C" int ds4_metal_hc_weighted_sum_split_tensor(ds4_metal_tensor *out, con
         n_embd, n_hc, n_tokens, stride);
     return cuda_ok(cudaGetLastError(), "hc_weighted_sum_split launch");
 }
-extern "C" int ds4_metal_hc_split_weighted_sum_tensor(
-        ds4_metal_tensor       *out,
-        ds4_metal_tensor       *split,
-        const ds4_metal_tensor *mix,
-        const ds4_metal_tensor *residual_hc,
+extern "C" int ds4_gpu_hc_split_weighted_sum_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *split,
+        const ds4_gpu_tensor *mix,
+        const ds4_gpu_tensor *residual_hc,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                scale_offset,
@@ -9455,12 +9455,12 @@ extern "C" int ds4_metal_hc_split_weighted_sum_tensor(
             n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps);
     return cuda_ok(cudaGetLastError(), "hc split weighted sum launch");
 }
-extern "C" int ds4_metal_hc_split_weighted_sum_norm_tensor(
-        ds4_metal_tensor       *out,
-        ds4_metal_tensor       *norm_out,
-        ds4_metal_tensor       *split,
-        const ds4_metal_tensor *mix,
-        const ds4_metal_tensor *residual_hc,
+extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *split,
+        const ds4_gpu_tensor *mix,
+        const ds4_gpu_tensor *residual_hc,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                scale_offset,
@@ -9515,17 +9515,17 @@ extern "C" int ds4_metal_hc_split_weighted_sum_norm_tensor(
             return cuda_ok(cudaGetLastError(), "hc split weighted sum norm launch");
         }
     }
-    return ds4_metal_hc_split_weighted_sum_tensor(out, split, mix, residual_hc,
+    return ds4_gpu_hc_split_weighted_sum_tensor(out, split, mix, residual_hc,
                                                   model_map, model_size,
                                                   scale_offset, base_offset,
                                                   n_embd, n_hc,
                                                   sinkhorn_iters, eps) &&
-           ds4_metal_rms_norm_weight_tensor(norm_out, out, model_map, model_size,
+           ds4_gpu_rms_norm_weight_tensor(norm_out, out, model_map, model_size,
                                             norm_weight_offset, n_embd, norm_eps);
 }
-extern "C" int ds4_metal_output_hc_weights_tensor(
-        ds4_metal_tensor       *out,
-        const ds4_metal_tensor *pre,
+extern "C" int ds4_gpu_output_hc_weights_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *pre,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                scale_offset,
@@ -9555,7 +9555,7 @@ extern "C" int ds4_metal_output_hc_weights_tensor(
             eps);
     return cuda_ok(cudaGetLastError(), "output hc weights launch");
 }
-extern "C" int ds4_metal_hc_expand_tensor(ds4_metal_tensor *out_hc, const ds4_metal_tensor *block_out, const ds4_metal_tensor *residual_hc, const ds4_metal_tensor *post, const ds4_metal_tensor *comb, uint32_t n_embd, uint32_t n_hc) {
+extern "C" int ds4_gpu_hc_expand_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *post, const ds4_gpu_tensor *comb, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !residual_hc || !post || !comb || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * sizeof(float)));
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
@@ -9569,7 +9569,7 @@ extern "C" int ds4_metal_hc_expand_tensor(ds4_metal_tensor *out_hc, const ds4_me
                                                     n_hc, n_hc * n_hc, 0);
     return cuda_ok(cudaGetLastError(), "hc_expand launch");
 }
-extern "C" int ds4_metal_hc_expand_split_tensor(ds4_metal_tensor *out_hc, const ds4_metal_tensor *block_out, const ds4_metal_tensor *residual_hc, const ds4_metal_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+extern "C" int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * sizeof(float)));
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
@@ -9585,7 +9585,7 @@ extern "C" int ds4_metal_hc_expand_split_tensor(ds4_metal_tensor *out_hc, const 
                                                     mix_hc, mix_hc, 0);
     return cuda_ok(cudaGetLastError(), "hc_expand_split launch");
 }
-extern "C" int ds4_metal_hc_expand_add_split_tensor(ds4_metal_tensor *out_hc, const ds4_metal_tensor *block_out, const ds4_metal_tensor *block_add, const ds4_metal_tensor *residual_hc, const ds4_metal_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !block_add || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * sizeof(float)));
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
@@ -9601,18 +9601,18 @@ extern "C" int ds4_metal_hc_expand_add_split_tensor(ds4_metal_tensor *out_hc, co
                                                     mix_hc, mix_hc, 1);
     return cuda_ok(cudaGetLastError(), "hc_expand_add_split launch");
 }
-extern "C" int ds4_metal_shared_down_hc_expand_q8_0_tensor(
-        ds4_metal_tensor       *out_hc,
-        ds4_metal_tensor       *shared_out,
+extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *shared_out,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_metal_tensor *shared_mid,
-        const ds4_metal_tensor *routed_out,
-        const ds4_metal_tensor *residual_hc,
-        const ds4_metal_tensor *split,
+        const ds4_gpu_tensor *shared_mid,
+        const ds4_gpu_tensor *routed_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
     if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL) {
@@ -9627,24 +9627,24 @@ extern "C" int ds4_metal_shared_down_hc_expand_q8_0_tensor(
                                                         n_embd, n_hc,
                                                         "shared_down_hc_expand");
     }
-    return ds4_metal_matmul_q8_0_tensor(shared_out, model_map, model_size,
+    return ds4_gpu_matmul_q8_0_tensor(shared_out, model_map, model_size,
                                         weight_offset, in_dim, out_dim,
                                         shared_mid, 1) &&
-           ds4_metal_hc_expand_add_split_tensor(out_hc, shared_out, routed_out,
+           ds4_gpu_hc_expand_add_split_tensor(out_hc, shared_out, routed_out,
                                                 residual_hc, split, n_embd, n_hc);
 }
 
-extern "C" int ds4_metal_matmul_q8_0_hc_expand_tensor(
-        ds4_metal_tensor       *out_hc,
-        ds4_metal_tensor       *block_out,
+extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
-        const ds4_metal_tensor *x,
-        const ds4_metal_tensor *residual_hc,
-        const ds4_metal_tensor *split,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
     if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL) {
@@ -9659,8 +9659,8 @@ extern "C" int ds4_metal_matmul_q8_0_hc_expand_tensor(
                                                         n_embd, n_hc,
                                                         "q8_hc_expand");
     }
-    return ds4_metal_matmul_q8_0_tensor(block_out, model_map, model_size,
+    return ds4_gpu_matmul_q8_0_tensor(block_out, model_map, model_size,
                                         weight_offset, in_dim, out_dim, x, 1) &&
-           ds4_metal_hc_expand_split_tensor(out_hc, block_out, residual_hc,
+           ds4_gpu_hc_expand_split_tensor(out_hc, block_out, residual_hc,
                                             split, n_embd, n_hc);
 }

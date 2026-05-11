@@ -54,7 +54,7 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o rax.o $(CPU_CORE_OBJS) $(LDLIBS)
 endif
 
-ds4.o: ds4.c ds4.h ds4_metal.h
+ds4.o: ds4.c ds4.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_cli.o: ds4_cli.c ds4.h linenoise.h
@@ -72,19 +72,19 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_metal.h
-	$(CC) $(CFLAGS) -DDS4_NO_METAL -c -o $@ ds4.c
+ds4_cpu.o: ds4.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h linenoise.h
-	$(CC) $(CFLAGS) -DDS4_NO_METAL -c -o $@ ds4_cli.c
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_cli.c
 
 ds4_server_cpu.o: ds4_server.c ds4.h rax.h
-	$(CC) $(CFLAGS) -DDS4_NO_METAL -c -o $@ ds4_server.c
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_server.c
 
-ds4_metal.o: ds4_metal.m ds4_metal.h $(METAL_SRCS)
+ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
-ds4_cuda.o: ds4_cuda.cu ds4_metal.h ds4_iq2_tables_cuda.inc
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
 ds4_test: ds4_test.o rax.o $(CORE_OBJS)

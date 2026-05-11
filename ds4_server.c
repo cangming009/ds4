@@ -7962,7 +7962,7 @@ static ds4_backend parse_backend_arg(const char *s, const char *arg) {
 }
 
 static ds4_backend default_server_backend(void) {
-#ifdef DS4_NO_METAL
+#ifdef DS4_NO_GPU
     return DS4_BACKEND_CPU;
 #elif defined(__APPLE__)
     return DS4_BACKEND_METAL;
