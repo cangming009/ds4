@@ -7885,6 +7885,12 @@ static void usage(FILE *fp) {
         "      CPU helper threads for lightweight host-side work.\n"
         "  --quality\n"
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
+        "  --dir-steering-file FILE\n"
+        "      Load one f32 direction vector per layer for directional steering.\n"
+        "  --dir-steering-ffn F\n"
+        "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1\n"
+        "  --dir-steering-attn F\n"
+        "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
         "\n"
@@ -7960,6 +7966,7 @@ static server_config parse_options(int argc, char **argv) {
     };
     c.kv_cache = kv_cache_default_options();
 
+    bool directional_steering_scale_set = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -8007,6 +8014,14 @@ static server_config parse_options(int argc, char **argv) {
             c.tool_memory_max_ids = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
+        } else if (!strcmp(arg, "--dir-steering-file")) {
+            c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dir-steering-ffn")) {
+            c.engine.directional_steering_ffn = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            directional_steering_scale_set = true;
+        } else if (!strcmp(arg, "--dir-steering-attn")) {
+            c.engine.directional_steering_attn = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            directional_steering_scale_set = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--cpu") || !strcmp(arg, "--backend")) {
@@ -8024,6 +8039,9 @@ static server_config parse_options(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens");
         exit(2);
+    }
+    if (c.engine.directional_steering_file && !directional_steering_scale_set) {
+        c.engine.directional_steering_ffn = 1.0f;
     }
     return c;
 }

@@ -472,6 +472,13 @@ static void *xmalloc(size_t size) {
     return p;
 }
 
+static char *ds4_strdup(const char *s) {
+    size_t n = strlen(s);
+    char *p = xmalloc(n + 1);
+    memcpy(p, s, n + 1);
+    return p;
+}
+
 static void *xrealloc(void *ptr, size_t size) {
     ds4_alloc_guard_check("realloc", size);
     void *p = realloc(ptr, size);
@@ -7943,12 +7950,16 @@ typedef struct {
     ds4_metal_tensor *batch_routed_out;
     ds4_metal_tensor *batch_ffn_out;
     bool materialize_ffn_out;
+    ds4_metal_tensor *directional_steering_dirs;
+    float directional_steering_attn_scale;
+    float directional_steering_ffn_scale;
     bool quality;
     bool mtp_enabled;
 } ds4_metal_graph;
 
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_metal_graph *g) {
+    ds4_metal_tensor_free(g->directional_steering_dirs);
     ds4_metal_tensor_free(g->batch_ffn_out);
     ds4_metal_tensor_free(g->batch_routed_out);
     ds4_metal_tensor_free(g->batch_routed_down);
@@ -8088,6 +8099,93 @@ static bool metal_tensor_fill_f32(ds4_metal_tensor *t, float v, uint64_t n) {
 }
 
 /* =========================================================================
+ * Directional Steering.
+ * =========================================================================
+ *
+ * A steering file contains one normalized 4096-wide direction per layer.  When
+ * enabled, the Metal graph edits selected block outputs in-place:
+ *
+ *     y = y - scale * v * dot(v, y)
+ *
+ * Positive scales remove the represented direction from the activation.
+ * Negative scales add it.  This is deliberately explicit and opt-in; with zero
+ * scales, the release graph does not allocate the direction tensor and follows
+ * the normal inference path.
+ */
+
+static bool metal_graph_load_directional_steering(
+        ds4_metal_graph *g,
+        const char      *path,
+        float            attn_scale,
+        float            ffn_scale) {
+    if (attn_scale == 0.0f && ffn_scale == 0.0f) return true;
+
+    if (!path || !path[0]) {
+        fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
+        return false;
+    }
+
+    const uint64_t n = (uint64_t)DS4_N_LAYER * DS4_N_EMBD;
+    float *dirs = xmalloc((size_t)n * sizeof(dirs[0]));
+    bool ok = read_f32_binary_file(path, dirs, n);
+    if (ok) {
+        g->directional_steering_dirs = ds4_metal_tensor_alloc(n * sizeof(dirs[0]));
+        ok = g->directional_steering_dirs != NULL &&
+             ds4_metal_tensor_write(g->directional_steering_dirs, 0, dirs, n * sizeof(dirs[0])) != 0;
+    }
+    free(dirs);
+
+    if (!ok) {
+        fprintf(stderr, "ds4: failed to load directional steering vectors from %s\n", path);
+        return false;
+    }
+    g->directional_steering_attn_scale = attn_scale;
+    g->directional_steering_ffn_scale = ffn_scale;
+    fprintf(stderr, "ds4: directional steering enabled: %s attn=%g ffn=%g\n",
+            path, (double)attn_scale, (double)ffn_scale);
+    return true;
+}
+
+static bool metal_graph_directional_steering_attn_enabled(const ds4_metal_graph *g) {
+    return g && g->directional_steering_dirs && g->directional_steering_attn_scale != 0.0f;
+}
+
+static bool metal_graph_directional_steering_ffn_enabled(const ds4_metal_graph *g) {
+    return g && g->directional_steering_dirs && g->directional_steering_ffn_scale != 0.0f;
+}
+
+static bool metal_graph_apply_directional_steering(
+        ds4_metal_graph  *g,
+        ds4_metal_tensor *x,
+        uint32_t          il,
+        uint32_t          rows,
+        float             scale) {
+    if (!g || !g->directional_steering_dirs || scale == 0.0f) return true;
+    return ds4_metal_directional_steering_project_tensor(x,
+                                            g->directional_steering_dirs,
+                                            il,
+                                            DS4_N_EMBD,
+                                            rows,
+                                            scale) != 0;
+}
+
+static bool metal_graph_apply_directional_steering_attn(
+        ds4_metal_graph  *g,
+        ds4_metal_tensor *x,
+        uint32_t          il,
+        uint32_t          rows) {
+    return metal_graph_apply_directional_steering(g, x, il, rows, g ? g->directional_steering_attn_scale : 0.0f);
+}
+
+static bool metal_graph_apply_directional_steering_ffn(
+        ds4_metal_graph  *g,
+        ds4_metal_tensor *x,
+        uint32_t          il,
+        uint32_t          rows) {
+    return metal_graph_apply_directional_steering(g, x, il, rows, g ? g->directional_steering_ffn_scale : 0.0f);
+}
+
+/* =========================================================================
  * Metal Diagnostic Dump Hooks.
  * =========================================================================
  *
@@ -8176,7 +8274,9 @@ static void metal_graph_debug_dump_i32_tensor(
 }
 
 static bool metal_graph_needs_ffn_out(const ds4_metal_graph *g, uint32_t il, uint32_t pos) {
-    return g->materialize_ffn_out || metal_graph_debug_wants("ffn_out", il, pos);
+    return metal_graph_directional_steering_ffn_enabled(g) ||
+           g->materialize_ffn_out ||
+           metal_graph_debug_wants("ffn_out", il, pos);
 }
 
 static bool metal_graph_ensure_ffn_out(ds4_metal_graph *g) {
@@ -9181,7 +9281,9 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_back", g->heads, q_dim, il, pos);
     }
-    const bool fuse_attn_out_hc = !metal_graph_use_reference_attn_out_hc();
+    const bool fuse_attn_out_hc =
+        !metal_graph_directional_steering_attn_enabled(g) &&
+        !metal_graph_use_reference_attn_out_hc();
     if (ok && fuse_attn_out_hc) {
         ok = ds4_metal_attention_output_low_q8_tensor(g->attn_low,
                                                       model->map,
@@ -9224,6 +9326,9 @@ static bool metal_graph_encode_decode_layer(
     }
     if (ok) {
         metal_graph_debug_dump_tensor("attn_out", g->attn_out, DS4_N_EMBD, il, pos);
+    }
+    if (ok && metal_graph_directional_steering_attn_enabled(g)) {
+        ok = metal_graph_apply_directional_steering_attn(g, g->attn_out, il, 1);
     }
     if (ok && !fuse_attn_out_hc) {
         ok = ds4_metal_hc_expand_tensor(g->after_attn_hc, g->attn_out, g->cur_hc,
@@ -9399,7 +9504,18 @@ static bool metal_graph_encode_decode_layer(
     if (ok && keep_ffn_out) {
         metal_graph_debug_dump_tensor("ffn_out", g->ffn_out, DS4_N_EMBD, il, pos);
     }
-    if (ok && !fuse_shared_down_hc) {
+    if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        ok = metal_graph_apply_directional_steering_ffn(g, g->ffn_out, il, 1);
+    }
+    if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        ok = ds4_metal_hc_expand_tensor(g->after_ffn_hc,
+                                        g->ffn_out,
+                                        g->after_attn_hc,
+                                        g->hc_post,
+                                        g->hc_comb,
+                                        DS4_N_EMBD,
+                                        DS4_N_HC) != 0;
+    } else if (ok && !fuse_shared_down_hc) {
         ok = ds4_metal_hc_expand_add_split_tensor(g->after_ffn_hc,
                                                   g->routed_out,
                                                   g->shared_out,
@@ -11860,6 +11976,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("output_proj");
+    if (ok && metal_graph_directional_steering_attn_enabled(g)) {
+        ok = metal_graph_apply_directional_steering_attn(g, g->batch_attn_out, il, n_tokens);
+    }
     if (ok) ok = ds4_metal_hc_expand_split_tensor(after_attn_hc_view,
                                                   g->batch_attn_out,
                                                   g->batch_cur_hc,
@@ -12110,13 +12229,25 @@ static bool metal_graph_encode_layer_ffn_batch(
         metal_graph_debug_dump_tensor("ffn_out", g->batch_ffn_out,
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
-    if (ok) ok = ds4_metal_hc_expand_add_split_tensor(next_hc_view,
-                                                       g->batch_routed_out,
-                                                       g->batch_shared_out,
-                                                       g->batch_after_attn_hc,
-                                                       hc_split_view,
-                                                       DS4_N_EMBD,
-                                                       DS4_N_HC) != 0;
+    if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        ok = metal_graph_apply_directional_steering_ffn(g, g->batch_ffn_out, il, n_tokens);
+    }
+    if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        ok = ds4_metal_hc_expand_split_tensor(next_hc_view,
+                                              g->batch_ffn_out,
+                                              g->batch_after_attn_hc,
+                                              hc_split_view,
+                                              DS4_N_EMBD,
+                                              DS4_N_HC) != 0;
+    } else if (ok) {
+        ok = ds4_metal_hc_expand_add_split_tensor(next_hc_view,
+                                                  g->batch_routed_out,
+                                                  g->batch_shared_out,
+                                                  g->batch_after_attn_hc,
+                                                  hc_split_view,
+                                                  DS4_N_EMBD,
+                                                  DS4_N_HC) != 0;
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_post", g->batch_next_hc,
                                       (uint64_t)n_tokens * hc_dim, il, pos0);
@@ -13541,6 +13672,9 @@ struct ds4_engine {
     ds4_backend backend;
     int mtp_draft_tokens;
     float mtp_margin;
+    char *directional_steering_file;
+    float directional_steering_attn_scale;
+    float directional_steering_ffn_scale;
     bool quality;
     bool metal_ready;
     bool mtp_ready;
@@ -14536,6 +14670,9 @@ static int generate_metal_graph_raw_swa(
         int                 n_predict,
         int                 ctx_size,
         bool                quality,
+        const char        * directional_steering_file,
+        float               directional_steering_attn,
+        float               directional_steering_ffn,
         ds4_token_emit_fn   emit,
         ds4_generation_done_fn done,
         void              * emit_ud,
@@ -14564,6 +14701,13 @@ static int generate_metal_graph_raw_swa(
         return 1;
     }
     g.quality = quality;
+    if (!metal_graph_load_directional_steering(&g,
+                                               directional_steering_file,
+                                               directional_steering_attn,
+                                               directional_steering_ffn)) {
+        metal_graph_free(&g);
+        return 1;
+    }
     const bool memory_report = getenv("DS4_METAL_MEMORY_REPORT") != NULL;
     if (memory_report) ds4_metal_print_memory_report("after graph alloc");
 
@@ -15507,7 +15651,11 @@ int ds4_engine_generate_argmax(
             return 1;
         }
         return generate_metal_graph_raw_swa(model, vocab, weights, prompt,
-                                            n_predict, ctx_size, e->quality, emit, done, emit_ud,
+                                            n_predict, ctx_size, e->quality,
+                                            e->directional_steering_file,
+                                            e->directional_steering_attn_scale,
+                                            e->directional_steering_ffn_scale,
+                                            emit, done, emit_ud,
                                             progress, progress_ud);
 #else
         fprintf(stderr, "ds4: Metal generation requested but this build has no Metal support\n");
@@ -15713,6 +15861,19 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
+    if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
+        (!opt->directional_steering_file || !opt->directional_steering_file[0]))
+    {
+        fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
+        free(e);
+        *out = NULL;
+        return 1;
+    }
+    if (opt->directional_steering_file && opt->directional_steering_file[0]) {
+        e->directional_steering_file = ds4_strdup(opt->directional_steering_file);
+        e->directional_steering_attn_scale = opt->directional_steering_attn;
+        e->directional_steering_ffn_scale = opt->directional_steering_ffn;
+    }
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     ds4_acquire_instance_lock();
 
@@ -15797,6 +15958,7 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_metal_cleanup();
 #endif
     ds4_release_instance_lock();
+    free(e->directional_steering_file);
     free(e);
 }
 
@@ -15821,6 +15983,14 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 1;
     }
     s->graph.quality = e->quality;
+    if (!metal_graph_load_directional_steering(&s->graph,
+                                               e->directional_steering_file,
+                                               e->directional_steering_attn_scale,
+                                               e->directional_steering_ffn_scale)) {
+        metal_graph_free(&s->graph);
+        free(s);
+        return 1;
+    }
     s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     if (e->mtp_ready) {
         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));

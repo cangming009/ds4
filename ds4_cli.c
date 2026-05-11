@@ -97,6 +97,12 @@ static void usage(FILE *fp) {
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
+        "  --dir-steering-file FILE\n"
+        "      Load one f32 direction vector per layer for directional steering.\n"
+        "  --dir-steering-ffn F\n"
+        "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1\n"
+        "  --dir-steering-attn F\n"
+        "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before generation. Slower startup, fewer first-use stalls.\n"
         "\n"
@@ -1171,6 +1177,7 @@ static cli_config parse_options(int argc, char **argv) {
         },
     };
 
+    bool directional_steering_scale_set = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -1211,6 +1218,14 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
+        } else if (!strcmp(arg, "--dir-steering-file")) {
+            c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dir-steering-ffn")) {
+            c.engine.directional_steering_ffn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            directional_steering_scale_set = true;
+        } else if (!strcmp(arg, "--dir-steering-attn")) {
+            c.engine.directional_steering_attn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            directional_steering_scale_set = true;
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--backend")) {
@@ -1259,6 +1274,10 @@ static cli_config parse_options(int argc, char **argv) {
             usage(stderr);
             exit(2);
         }
+    }
+
+    if (c.engine.directional_steering_file && !directional_steering_scale_set) {
+        c.engine.directional_steering_ffn = 1.0f;
     }
 
     return c;

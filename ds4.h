@@ -61,6 +61,9 @@ typedef struct {
     int n_threads;
     int mtp_draft_tokens;
     float mtp_margin;
+    const char *directional_steering_file;
+    float directional_steering_attn;
+    float directional_steering_ffn;
     bool warm_weights;
     bool quality;
 } ds4_engine_options;

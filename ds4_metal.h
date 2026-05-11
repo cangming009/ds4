@@ -569,6 +569,14 @@ int ds4_metal_add_tensor(
         const ds4_metal_tensor *b,
         uint32_t                n);
 
+int ds4_metal_directional_steering_project_tensor(
+        ds4_metal_tensor       *x,
+        const ds4_metal_tensor *directions,
+        uint32_t                layer,
+        uint32_t                width,
+        uint32_t                rows,
+        float                   scale);
+
 int ds4_metal_router_select_tensor(
         ds4_metal_tensor       *selected,
         ds4_metal_tensor       *weights,
