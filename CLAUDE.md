@@ -37,6 +37,40 @@ Inference engine for **DeepSeek V4 Flash only** — not a generic GGUF runner. S
 
 **Model constants:** 43 layers, 4096 emb dim, 129280 vocab, 64 Q heads / 1 KV head, 512 head dim, 256 experts (6 active), SWA 128, HC factor 4.
 
+## Deployment (macOS / Mac Studio M3 Ultra 512GB)
+
+```sh
+# 1. 下载模型 (一次性的)
+./download_model.sh q2       # 2-bit 量化, ~81GB, 适用于 128GB+ 机器
+./download_model.sh mtp      # MTP 推测解码草稿模型, ~3.5GB
+
+# 2. 编译
+make ds4-server   # 或 make 编译全部
+
+# 3. 启动服务器
+./start_server_custom.sh     # 定制版: MAX_TOKENS=8192, KV_CACHE_MAX_ENTRIES=50, PREFILL_CHUNK=4096
+# 或上游版:   ./start_server.sh
+```
+
+**启动脚本自动处理：**
+- 清理旧 ds4-server 进程
+- 验证模型文件 (`ds4flash.gguf` symlink → `gguf/<model>`)
+- 自动检测 MTP 草稿模型 (`gguf/*MTP*.gguf`)
+- 设置磁盘 KV 缓存 (`kv-cache/`, 默认 16GB 预算)
+- 日志输出到 `logs/ds4-server_YYYYMMDD_HHMMSS.log`
+- 输出同时显示在终端和日志文件
+
+**默认配置：** Think Max (ctx=393216), 端口 8000, 127.0.0.1, 权重预热, 精确内核
+
+**常用选项：**
+```sh
+./start_server_custom.sh --port 8080 --host 0.0.0.0   # 局域网暴露
+./start_server_custom.sh --no-kv-cache --no-quality    # 轻量模式
+./start_server_custom.sh --build                       # 启动前重新编译
+```
+
+**Client 集成：** 服务器暴露 OpenAI `/v1/chat/completions` + Anthropic `/v1/messages` 兼容端点；通过 README 中的配置片段可对接 Claude Code / opencode / Pi 等 agent 客户端。
+
 ## Key Rules
 
 - **No C++** — strict C99 + Objective-C where Metal requires it
