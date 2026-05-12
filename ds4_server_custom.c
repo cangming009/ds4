@@ -1,22 +1,39 @@
 /* ds4_server_custom.c — Custom extensions for ds4-server.
  *
- * This file is #included at the end of ds4_server.c (unity build) and
- * provides the stats dashboard, KV cache management UI, and related hooks.
- *
- * By keeping all custom additions in a separate file, merging upstream
- * changes to ds4_server.c produces far fewer conflicts — the custom code
- * lives entirely here.
- *
- * ===== Hook interface (forward-declared in ds4_server.c) =====
- *   custom_kv_cache_evict_max_entries(kc)
- *   custom_record_stats(s, j, ttft_ms, t0, final_finish, cached, completion, thinking_inside)
- *   custom_handle_route(s, fd, hr)         — hr is void * (http_request *)
- *   custom_server_init(s, model_path, host, port, ctx_size, warm_weights, quality)
- *   custom_server_close(s)
+ * This is the main compilation entry point (see Makefile).  It includes the
+ * upstream ds4_server.c and provides custom hooks (stats dashboard, KV cache
+ * management UI, etc.) that live entirely here — keeping them out of the
+ * upstream file eliminates merge conflicts.
  *
  * The server struct has a single opaque field: void *custom_ctx.
  * All custom state lives in this file's custom_context struct.
  * ============================================================ */
+
+/* ===== Entry-point compilation =====
+ * The Makefile passes -D DS4_CUSTOM_ENTRY when compiling this file directly.
+ * Tests compile ds4_server.c directly (which #includes this file), so the
+ * forward declarations and ds4_server.c include are skipped in that path. */
+#ifdef DS4_CUSTOM_ENTRY
+#include "ds4.h"
+
+/* Forward-declare struct tags used by hook signatures.
+ * Incomplete types are fine for pointer parameters. */
+struct server;
+struct job;
+struct kv_disk_cache;
+
+static void custom_kv_cache_evict_max_entries(struct kv_disk_cache *kc);
+static void custom_record_stats(struct server *s, struct job *j, double ttft_ms, double t0,
+                                const char *final_finish, int cached, int completion,
+                                int thinking_inside);
+static bool custom_handle_route(struct server *s, int fd, void *hr);
+static void custom_server_init(struct server *s, const char *model_path, const char *host,
+                               int port, int ctx_size, bool warm_weights, bool quality);
+static void custom_server_close(struct server *s);
+
+/* Pull in the entire upstream server — functions, main(), everything */
+#include "ds4_server.c"
+#endif /* DS4_CUSTOM_ENTRY */
 
 #include "dashboard_html.h"
 

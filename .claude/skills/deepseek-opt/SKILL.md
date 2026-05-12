@@ -33,6 +33,32 @@ dashboard_html.h: dashboard.html
 
 The `ds4_server.o` build rule depends on `dashboard_html.h`. To modify the dashboard, edit `dashboard.html` and rebuild — no C string escaping needed.
 
+### Custom Build Architecture (ds4_server_custom.c)
+
+The server is compiled via `ds4_server_custom.c` as the entry point (NOT `ds4_server.c` directly). This file serves as a custom overlay:
+
+```makefile
+ds4_server.o: ds4_server_custom.c ds4_server.c dashboard_html.h ds4.h rax.h
+	$(CC) $(CFLAGS) -D DS4_CUSTOM_ENTRY -c -o $@ ds4_server_custom.c
+```
+
+**Architecture**:
+- `ds4_server_custom.c` forward-declares custom hooks → `#include "ds4_server.c"` (upstream) → custom hook implementations
+- Upstream `ds4_server.c` is compiled as part of the custom file, with guards (`#ifndef DS4_CUSTOM_ENTRY`) to skip its own forward declarations and `#include "ds4_server_custom.c"` when compiled via this path
+- Tests still compile `ds4_server.c` directly (no `DS4_CUSTOM_ENTRY`), so the old unity-build path still works
+
+**Scope**: `ds4_server_custom.c` only handles monitoring/stats hooks — it wraps upstream `ds4_server.c` without modifying it. All other files should remain untouched.
+
+**When syncing upstream `ds4_server.c` changes, only `ds4_server_custom.c` may need updating**:
+
+1. **Hook signatures** — check if upstream changed the 5 hook calls (`custom_kv_cache_evict_max_entries`, `custom_record_stats`, `custom_handle_route`, `custom_server_init`, `custom_server_close`). If so, update their forward declarations in `ds4_server_custom.c`.
+
+2. **Types used by hooks** — if upstream renamed types (`server`, `job`, `kv_disk_cache`, etc.), update the `struct` tag forward declarations at the top of `ds4_server_custom.c`.
+
+3. **Custom implementation** — if upstream behavior changed in areas your hooks touch (stats, KV cache, routing), adapt the implementations accordingly.
+
+No other files need changes — the guards in `ds4_server.c` (`#ifndef DS4_CUSTOM_ENTRY`) and Makefile are one-time setup and don't need updating.
+
 ## CRITICAL: C String Pitfall in HTML/JS Generation (Legacy)
 
 **This bug no longer applies to the current codebase** — the dashboard HTML was extracted to `dashboard.html` and is embedded via `xxd -i` at build time. The section below is kept for reference in case inline HTML strings reappear.
@@ -117,6 +143,25 @@ Production deployment specs:
 | TOOLS + DSML_START, ctx=97K | 24 t/s | no quality, mtp-draft=2 |
 | TOOLS + DSML_START, ctx=122K | **22.3 t/s** | **no quality, no MTP, chunk=4096** |
 | TOOLS + DSML_START, ctx=124K | **22.3 t/s** | **no quality, no MTP, chunk=4096** (2nd round) |
+
+### Greedy Decode Throughput (ds4-bench, chunk=2048)
+
+纯 greedy decode 基准测试（2025-05-11），`ds4-bench --prompt-file bench/promessi_sposi.txt --gen-tokens 128 --step-incr 2048`：
+
+| ctx | Prefill (t/s) | Gen (t/s) |
+|-----|--------------|-----------|
+| 2,048 | 544.55 | 27.07 |
+| 4,096 | 484.59 | 26.94 |
+| 8,192 | 471.72 | 26.76 |
+| 16,384 | 447.46 | 26.19 |
+| 24,576 | 425.90 | 25.76 |
+| 32,768 | 404.15 | 25.47 |
+
+**说明**：
+- 这是纯 GPU decode 理论上限（greedy, no HTTP, no DSML, no sampling）
+- Prefill 从 545 → 404 t/s（-26%），decoder 从 27.07 → 25.47 t/s（-6%），MLA 衰减极小
+- 生产环境工具调用速度（~22 t/s）比 benchmark 低 ~3-5 t/s，原因是 HTTP 流式、JSON 组包、DSML_START 检测、采样等 CPU 开销
+- 设 `DS4_METAL_PREFILL_CHUNK=4096` 可将 prefill 提升 ~24%
 
 **关键发现：**
 

@@ -1,10 +1,10 @@
-# ds4.c
+# DwarfStar 4
 
-`ds4.c` is a small native inference engine for DeepSeek V4 Flash. It is
+DrawfStar 4 is a small native inference engine for DeepSeek V4 Flash. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
 runtime, and not a framework. The main path is a DeepSeek V4 Flash-specific
-Metal graph executor with DS4-specific loading, prompt rendering, KV state, and
-server API glue.
+Metal and CUDA graph executor with DS4-specific loading, prompt rendering,
+KV state, and server API glue.
 
 This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
@@ -29,7 +29,7 @@ That said, a few important things about this project:
 * This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
 * This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**.
 * Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. This inference engine only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is just alpha quality code, so probably we are not still there.
-* This is **Metal-only**, may implement CUDA support in the future? Perhaps, but nothing more. The CPU path is only for correctness check, but **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. It was not possible to fix the CPU inference to avoid crashing, since each time you have to restart the computer, which is not funny. Help us, if you have the guts.
+* The optimized graph path targets **Metal on macOS** and **CUDA on Linux**. The CPU path is only for correctness checks and model/tokenizer diagnostics. For CPU-only Linux builds, use `make cpu`; it builds the normal `./ds4` and `./ds4-server` binaries without CUDA or Metal. On macOS, **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. It was not possible to fix the CPU inference to avoid crashing, since each time you have to restart the computer, which is not funny. Help us, if you have the guts.
 
 ## Acknowledgements to llama.cpp and GGML
 
@@ -40,9 +40,18 @@ We are thankful and indebted to [`llama.cpp`](https://github.com/ggml-org/llama.
 and its contributors. Their implementation, kernels, tests, and design choices were
 an essential reference while building this DeepSeek V4 Flash-specific inference path.
 Some source-level pieces are retained or adapted here under the MIT license: GGUF
-quant layouts and tables, CPU quant/dot logic, and certain Metal kernels. For this
+quant layouts and tables, CPU quant/dot logic, and certain kernels. For this
 reason, and because we are genuinely grateful, we keep the GGML authors copyright
 notice in our `LICENSE` file.
+
+## Status
+
+The code and GGUF files are to be considered of **alpha quality** because
+inference and model serving is a complicated matter and all this exists
+only for a few days. It will take months to reach a more stable form.
+However, we try to keep the project in a usable state, and we are making
+progresses. If you have issues, make sure to use `--trace` to log the
+sessions, and open issues including the full trace.
 
 ## Model Weights
 
@@ -102,6 +111,37 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | Mac Studio M3 Ultra, 512 GB | q2 | 11709 tokens | 468.03 t/s | 27.39 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | 12018 tokens | 448.82 t/s | 26.62 t/s |
+| DGX Spark GB10, 128 GB | q2 | 7047 tokens | 343.81 t/s | 13.75 t/s |
+
+![M3 Max t/s](bench/m3_max_ts.svg)
+
+## Benchmarking
+
+`ds4-bench` measures instantaneous prefill and generation throughput at context
+frontiers instead of reporting one whole-run average. It loads the model once,
+walks a fixed token sequence to frontiers such as 2048, 4096, 6144, and uses
+incremental prefill so each row measures only the newly-added token interval.
+After each frontier it saves the live KV state to memory, generates a fixed
+greedy non-EOS probe, restores the memory snapshot, and continues prefill.
+
+```sh
+./ds4-bench \
+  -m ds4flash.gguf \
+  --prompt-file bench/promessi_sposi.txt \
+  --ctx-start 2048 \
+  --ctx-max 65536 \
+  --step-incr 2048 \
+  --gen-tokens 128
+```
+
+The example file is a cleaned public-domain Project Gutenberg text of
+Alessandro Manzoni's *I Promessi Sposi* (ebook #45334), with the Gutenberg
+header and footer removed: <https://www.gutenberg.org/ebooks/45334>.
+
+Use `--step-incr N` for different linear spacing, or `--step-mul F` for
+exponential sweeps. Output is CSV with one row per frontier: latest prefill
+interval tokens/sec, generation tokens/sec at that frontier, and
+`kvcache_bytes`.
 
 ## CLI
 
@@ -119,7 +159,7 @@ ds4>
 ```
 
 The interactive CLI is a real multi-turn DS4 chat. It keeps the rendered chat
-transcript and the live Metal KV checkpoint, so each turn extends the previous
+transcript and the live graph KV checkpoint, so each turn extends the previous
 conversation. Useful commands are `/help`, `/think`, `/think-max`, `/nothink`,
 `/ctx N`, `/read FILE`, and `/quit`. Ctrl+C interrupts the current generation
 and returns to `ds4>`.
@@ -138,12 +178,12 @@ Start a local OpenAI/Anthropic-compatible server:
 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
-The server is Metal-only. It keeps one mutable graph/KV checkpoint in memory,
+The server keeps one mutable backend/KV checkpoint in memory,
 so stateless clients that resend a longer version of the same prompt can reuse
 the shared prefix instead of pre-filling from token zero.
 
 Request parsing and sockets run in client threads, but inference itself is
-serialized through one Metal worker. The current server does not batch multiple
+serialized through one graph worker. The current server does not batch multiple
 independent requests together; concurrent requests wait their turn on the single
 live graph/session.
 
@@ -167,7 +207,44 @@ clients. It accepts `system`, `messages`, `tools`, `tool_choice`, `max_tokens`,
 controls. Tool uses are returned as Anthropic `tool_use` blocks.
 
 Both APIs support SSE streaming. In thinking mode, reasoning is streamed in the
-native API shape instead of being mixed into final text.
+native API shape instead of being mixed into final text. OpenAI chat streaming
+also streams tool calls as soon as the DSML invocation is recognized: the tool
+header is sent first, then parameter bytes are forwarded as
+`tool_calls[].function.arguments` deltas while generation continues. The
+Anthropic endpoint streams thinking and text live, then emits structured
+`tool_use` blocks when the generated tool block is complete.
+
+### Tool call handling and canonicalization
+
+DeepSeek V4 Flash emits tool calls as [DSML text](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/encoding/README.md). Agent clients do not send that
+same text back on the next request: they send normalized OpenAI/Anthropic JSON
+tool-call objects. **If the server re-rendered those objects slightly
+differently, the rendered byte prefix would no longer match the live KV
+checkpoint** and the next turn would have to be rebuilt.
+
+The first line of defense is exact replay. Every tool call gets an unguessable
+API tool ID, and the server remembers `tool id -> exact sampled DSML block` in
+a bounded in-memory map backed by radix trees. When the client later sends that
+tool ID back, the prompt renderer uses the exact DSML bytes the model sampled,
+not a freshly formatted approximation. This map can also be saved inside KV
+cache files, so exact replay survives server restarts for cached histories.
+
+**Canonicalization is only the backup path**. If the exact DSML block is missing,
+or exact replay is disabled with `--disable-exact-dsml-tool-replay`, the server
+renders a deterministic DSML form from the JSON tool object. After a tool-call
+turn, it compares the live sampled token stream with the prompt that the next
+client request will render. If needed, it rewrites the live checkpoint, or
+falls back to an older disk KV snapshot and replays only the suffix. This keeps
+the model continuation aligned with the stateless API transcript.
+
+During generation, the server also treats DSML syntax differently from payload.
+When the model is emitting stable protocol structure such as DSML tags,
+parameter headers, JSON punctuation, or closing markers, sampling is forced to
+`temperature=0` so the tool call stays parseable. This greedy mode does **not**
+apply to argument payloads: `string=true` parameter bodies and JSON string
+values, including file contents and edit text, use the request's normal sampling
+settings. That separation is important: deterministic decoding is helpful for
+syntax, but can create repeated text when applied to long code or file bodies.
 
 Minimal OpenAI example:
 
@@ -341,10 +418,11 @@ non-thinking model alias such as `deepseek-chat`.
 ## Disk KV Cache
 
 Chat/completion APIs are stateless: agent clients usually resend the whole
-conversation every request. `ds4-server` handles this by comparing the rendered
-token stream with cached token prefixes. The live in-memory checkpoint covers
-the current session; the disk KV cache makes useful prefixes survive session
-switches and server restarts.
+conversation every request. `ds4-server` first tries the cheap exact token-prefix
+check, then falls back to comparing rendered prompt bytes with decoded
+checkpoint bytes. The live in-memory checkpoint covers the current session; the
+disk KV cache makes useful prefixes survive session switches and server
+restarts.
 
 For RAM reasons there is currently only one live KV cache in memory. When a new
 unrelated session replaces it, the old checkpoint can only be resumed without
@@ -358,16 +436,21 @@ Enable it with:
 ./ds4-server --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
-The cache key is the SHA1 of exact token IDs, not raw text. Each token ID is
-hashed as a little-endian 32-bit integer, and files are named `<sha1>.kv`.
+The cache key is the SHA1 of the rendered byte prefix, and files are named
+`<sha1>.kv`. The DS4 payload still stores the exact token IDs and graph state
+for that prefix. This matters for continued chats: the model may have generated
+one token whose decoded text is later sent back by a client as two canonical
+prompt tokens. A rendered byte-prefix hit can still reuse the checkpoint and
+tokenize only the new suffix.
 The file is intentionally written with ordinary `read`/`write` I/O, not
 `mmap`, so restoring cache entries does not add more VM mappings to a process
 that already maps the model.
 
-Tool calls also keep a small exact-DSML replay map keyed by unguessable tool
-IDs, so client JSON history can be rendered back to the exact sampled text. Use
-`--disable-exact-dsml-tool-replay` to disable this and fall back to canonical
-JSON-to-DSML rendering.
+Tool calls also keep a bounded exact-DSML replay map keyed by unguessable tool
+IDs, so client JSON history can be rendered back to the exact sampled text. The
+RAM map keeps up to 100000 IDs by default; tune it with `--tool-memory-max-ids`.
+Use `--disable-exact-dsml-tool-replay` to disable this and fall back to
+canonical JSON-to-DSML rendering.
 
 On disk, a cache file is:
 
@@ -398,10 +481,11 @@ The fixed header is little-endian:
 ```
 
 The rendered text is the tokenizer-decoded text for the cached token prefix.
-It is stored only for observability, so humans can inspect a cache directory
-without decoding token IDs. It is not used as the key and it is not trusted
-when loading; after load, the stored checkpoint tokens must still match the
-incoming request prefix.
+It is both the human-inspectable prefix and the lookup identity: its SHA1 is
+the filename, and a file is reusable only when those bytes are a prefix of the
+incoming rendered prompt. After load, the exact checkpoint tokens from the DS4
+payload remain authoritative, and only the incoming text suffix after the cached
+bytes is tokenized.
 
 The optional tool-id map is present only when header extension bit 0 is set.
 Appended sections use fixed bit order, so future extension bits can add fields
@@ -410,6 +494,27 @@ exact DSML block the model sampled. Only mappings whose DSML block is present
 in the rendered cached text are stored. This lets restarted servers render
 later client history byte-for-byte like the original model output, even if the
 client reorders JSON arguments.
+
+The current tool-id map section is:
+
+```text
+0   u8[3]  magic = "KTM"
+3   u8     version = 1
+4   u32    entry count
+
+For each entry:
+0   u32    tool id byte length
+4   u32    sampled DSML byte length
+8   bytes  tool id
+... bytes  exact sampled DSML block
+```
+
+The section is auxiliary replay memory, not model state. A cache hit restores
+the session payload first, then loads the map if present. Before rendering a
+request, the server can also scan cache files for the tool IDs present in the
+client history and load just those mappings, so an exact DSML replay can survive
+server restarts even when the matching KV snapshot is not the one ultimately
+used for the rendered-prefix hit.
 
 The DS4 session payload starts with thirteen little-endian `u32` fields:
 
@@ -456,7 +561,7 @@ builds for this model layout.
 The cache stores checkpoints at four moments:
 
 - `cold`: after a long first prompt reaches a stable prefix, before generation.
-- `continued`: when prefill or generation advances the live conversation by the configured interval.
+- `continued`: when prefill or generation reaches the next absolute aligned frontier.
 - `evict`: before an unrelated request replaces the live in-memory session.
 - `shutdown`: when the server exits cleanly.
 
@@ -466,14 +571,22 @@ future request appends text to the same prompt. The defaults are conservative:
 store prefixes of at least 512 tokens, cold-save prompts up to 30000 tokens,
 trim 32 tail tokens, and align to 2048-token chunks. The important knobs are:
 
+Continued saves use the same alignment and are written only when the live graph
+naturally reaches an absolute frontier. With the defaults this means roughly
+every 10k tokens, independent of where the first cold checkpoint landed, so long
+generations leave restart points behind without persisting the fragile final few
+tokens.
+
 - `--kv-cache-min-tokens`
 - `--kv-cache-cold-max-tokens`
 - `--kv-cache-continued-interval-tokens`
 - `--kv-cache-boundary-trim-tokens`
 - `--kv-cache-boundary-align-tokens`
+- `--tool-memory-max-ids`
+- `--disable-exact-dsml-tool-replay`
 
 By default, checkpoints may be reused across the 2-bit and 4-bit routed-expert
-variants if the token prefix matches. Use `--kv-cache-reject-different-quant`
+variants if the rendered prefix matches. Use `--kv-cache-reject-different-quant`
 when you want strict same-quant reuse only.
 
 The cache directory is disposable. If behavior looks suspicious, stop the
@@ -482,21 +595,37 @@ the kv cache files include the verbatim prompt cached.
 
 ## Backends
 
-The default backend is Metal:
+The default graph backend is Metal on macOS and CUDA on Linux CUDA builds:
 
 ```sh
 ./ds4 -p "Hello" --metal
+./ds4 -p "Hello" --cuda
 ```
 
 There is also a CPU reference/debug path:
 
 ```sh
 ./ds4 -p "Hello" --cpu
+make cpu
+./ds4
+./ds4 -p "Hello"
 ```
 
-Do not treat the CPU path as the production target. The server is Metal-only,
-and the optimized implementation lives in the Metal graph path. This may
-change in the future.
+Do not treat the CPU path as the production target. The CLI and `ds4-server`
+support the CPU backend for reference/debug use and share the same KV session
+and snapshot format as Metal and CUDA, but normal inference should use Metal or
+CUDA.
+
+## Steering
+
+This project supports steering with single-vector activation directions; see the
+`dir-steering` directory for more information. This follows the core idea of the
+[Refusal in Language Models Is Mediated by a Single Direction](https://arxiv.org/abs/2406.11717)
+paper. You can use it to make the model more or less verbose, less likely to
+answer programming questions if it is a chatbot for your car rental web site,
+and so forth, much faster than fine-tuning.
+This is also useful for cybersecurity researchers who want to reduce a model's
+willingness to provide dual-use or offensive security guidance.
 
 ## Test Vectors
 
