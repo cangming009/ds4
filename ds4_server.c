@@ -8081,8 +8081,11 @@ static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live) {
         kv_entry e = kc->entry[victim];
         if (unlink(e.path) == 0) {
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: kv cache evicted tokens=%u hits=%u size=%.2f MiB",
-                       e.tokens, e.hits, (double)e.file_size / (1024.0 * 1024.0));
+                       "ds4-server: kv cache evicted reason=disk-cache-full tokens=%u hits=%u size=%.2f MiB file=%s",
+                       e.tokens,
+                       e.hits,
+                       (double)e.file_size / (1024.0 * 1024.0),
+                       e.path ? e.path : "?");
             if (total >= e.file_size) total -= e.file_size;
             else total = 0;
         } else {
@@ -9082,6 +9085,7 @@ typedef struct {
     int prompt_tokens;
     int cached_tokens;
     char ctx[48];
+    const char *phase;
     bool has_tools;
     double t0;
     double last_t;
@@ -9110,7 +9114,7 @@ static void log_flags(char *buf, size_t len, bool tools, bool thinking,
 #undef ADD_FLAG
 }
 
-static void log_decode_progress(req_kind kind, const char *ctx, int completion,
+static void log_decode_progress(req_kind kind, int prompt_tokens, int completion,
                                 bool tools, bool thinking,
                                 bool dsml_start, bool dsml_end,
                                 double decode_t0,
@@ -9121,6 +9125,10 @@ static void log_decode_progress(req_kind kind, const char *ctx, int completion,
     const int interval_tokens = completion - *last_completion;
     const double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
     const double avg_tps = elapsed > 0.0 ? (double)completion / elapsed : 0.0;
+    char ctx[48];
+    request_ctx_span(ctx, sizeof(ctx),
+                     prompt_tokens + *last_completion,
+                     prompt_tokens + completion);
     char flags[80];
     log_flags(flags, sizeof(flags), tools, thinking, dsml_start, dsml_end);
     server_log(DS4_LOG_GENERATION,
@@ -9228,12 +9236,14 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     p->seen = true;
     char flags[64];
     log_flags(flags, sizeof(flags), p->has_tools, false, false, false);
+    const char *phase = p->phase ? p->phase : "prefill";
     server_log(DS4_LOG_PREFILL,
-               "ds4-server: %s ctx=%s%s%s prefill chunk %d/%d (%.1f%%) chunk=%.2f t/s avg=%.2f t/s %.3fs",
+               "ds4-server: %s ctx=%s%s%s %s chunk %d/%d (%.1f%%) chunk=%.2f t/s avg=%.2f t/s %.3fs",
                p->kind == REQ_CHAT ? "chat" : "completion",
                p->ctx,
                flags[0] ? " " : "",
                flags,
+               phase,
                display_current,
                display_total,
                pct,
@@ -9388,9 +9398,6 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
          * but the generated tail is too large to overwrite safely inside the
          * live raw-window ring.  Prefer an older disk checkpoint over replaying
          * a very long conversation from token zero. */
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: tool checkpoint canonicalization needs rebuild ctx=%s common=%d live=%d canonical=%d reason=\"%s\"",
-                   ctx, common, live_len, canonical.len, err);
         char *path = NULL;
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, rendered.ptr ? rendered.ptr : "",
@@ -9399,26 +9406,65 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
 
         char sync_err[160] = {0};
         const ds4_tokens *sync_prompt = loaded > 0 ? &effective : &canonical;
+        char rebuild_ctx[48];
+        request_ctx_span(rebuild_ctx, sizeof(rebuild_ctx), loaded, sync_prompt->len);
+        int replay_tokens = sync_prompt->len - loaded;
+        if (replay_tokens < 0) replay_tokens = sync_prompt->len;
+        int canonical_tail_tokens = canonical.len - common;
+        if (canonical_tail_tokens < 0) canonical_tail_tokens = canonical.len;
+        int discarded_live_tokens = live_len - common;
+        if (discarded_live_tokens < 0) discarded_live_tokens = 0;
+        const char *source = loaded > 0 ? "disk" : "full";
+        const double rebuild_t0 = now_sec();
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: tool checkpoint canonicalization needs %d tokens rebuild ctx=%s request_ctx=%s reason=canonical-tail-rewrite tail=%d discard=%d common=%d live=%d target=%d cached=%d source=%s%s%s",
+                   replay_tokens,
+                   rebuild_ctx,
+                   ctx,
+                   canonical_tail_tokens,
+                   discarded_live_tokens,
+                   common,
+                   live_len,
+                   canonical.len,
+                   loaded,
+                   source,
+                   path ? " file=" : "",
+                   path ? path : "");
+        server_prefill_progress rebuild_progress = {
+            .srv = s,
+            .kind = j->req.kind,
+            .prompt_tokens = sync_prompt->len,
+            .cached_tokens = loaded,
+            .phase = "tool checkpoint rebuild",
+            .has_tools = j->req.has_tools,
+            .t0 = rebuild_t0,
+        };
+        snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
+        ds4_session_set_progress(s->session, server_progress_cb, &rebuild_progress);
         if (ds4_session_sync(s->session, sync_prompt, sync_err, sizeof(sync_err)) == 0) {
+            ds4_session_set_progress(s->session, NULL, NULL);
+            const double rebuild_sec = now_sec() - rebuild_t0;
             if (loaded > 0) {
                 server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d via=disk cached=%d",
-                           ctx, common, live_len, canonical.len, loaded);
+                           "ds4-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=disk cached=%d replay=%d target=%d %.3fs",
+                           rebuild_ctx, ctx, loaded, replay_tokens, canonical.len, rebuild_sec);
                 trace_event(s, trace_id,
                             "tool checkpoint canonicalized via disk: common=%d live=%d canonical=%d cached=%d file=%s",
                             common, live_len, canonical.len, loaded, path ? path : "");
             } else {
                 server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d via=rebuild",
-                           ctx, common, live_len, canonical.len);
+                           "ds4-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=full cached=0 replay=%d target=%d %.3fs",
+                           rebuild_ctx, ctx, replay_tokens, canonical.len, rebuild_sec);
                 trace_event(s, trace_id,
                             "tool checkpoint canonicalized via rebuild: common=%d live=%d canonical=%d reason=%s",
                             common, live_len, canonical.len, err);
             }
         } else {
+            ds4_session_set_progress(s->session, NULL, NULL);
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: tool checkpoint canonicalization failed ctx=%s common=%d live=%d canonical=%d error=\"%s\"",
-                       ctx, common, live_len, canonical.len, sync_err);
+                       "ds4-server: tool checkpoint rebuild failed ctx=%s request_ctx=%s source=%s cached=%d replay=%d target=%d error=\"%s\"",
+                       rebuild_ctx, ctx, source, loaded, replay_tokens,
+                       canonical.len, sync_err);
             trace_event(s, trace_id, "tool checkpoint canonicalization failed after rebuild request: %s", sync_err);
         }
         ds4_tokens_free(&effective);
@@ -9907,7 +9953,7 @@ static void generate_job(server *s, job *j) {
             }
 
             if (completion >= next_decode_log) {
-                log_decode_progress(j->req.kind, ctx_span, completion,
+                log_decode_progress(j->req.kind, prompt_tokens, completion,
                                     j->req.has_tools,
                                     thinking.inside,
                                     saw_tool_start,
@@ -9953,7 +9999,7 @@ static void generate_job(server *s, job *j) {
     }
 
     if (completion > last_decode_log_completion) {
-        log_decode_progress(j->req.kind, ctx_span, completion,
+        log_decode_progress(j->req.kind, prompt_tokens, completion,
                             j->req.has_tools,
                             thinking.inside,
                             saw_tool_start,
