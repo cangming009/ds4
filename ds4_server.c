@@ -17,6 +17,7 @@
 #include <float.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -7437,6 +7438,11 @@ typedef struct {
     int continued_interval_tokens;
     int boundary_trim_tokens;
     int boundary_align_tokens;
+    /* If > 0, eviction multiplies each entry's hit count by
+     * 2 ** -((now - last_used) / hit_half_life_seconds).  0 disables decay,
+     * so once-popular files keep their hits + 1 multiplier forever, which is
+     * the historical behavior. */
+    int hit_half_life_seconds;
 } kv_cache_options;
 
 typedef struct {
@@ -8129,6 +8135,7 @@ static kv_cache_options kv_cache_default_options(void) {
         .continued_interval_tokens = KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS,
         .boundary_trim_tokens = KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS,
         .boundary_align_tokens = KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS,
+        .hit_half_life_seconds = 0,
     };
 }
 
@@ -8687,7 +8694,8 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
 }
 
 static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live,
-                                      const char *protected_sha) {
+                                      const char *protected_sha,
+                                      uint64_t now, int half_life_seconds) {
     if (!e || e->file_size == 0) return 0.0;
     (void)live;
     if (protected_sha && !strcmp(e->sha, protected_sha)) {
@@ -8706,14 +8714,26 @@ static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live,
      * so do not demote them just because they are a prefix of the live session.
      * Use hits+1 for eviction value so a just-written checkpoint does not get
      * deleted immediately just because its persisted hit counter is still 0.
+     *
+     * When half_life_seconds > 0, fold time-since-last_used into the bonus so
+     * a workload change does not let once-popular files outrank live prefixes
+     * forever.  Effective hits halve every half_life_seconds of inactivity.
+     * A fresh hit rewrites last_used, so matching prompts re-boost the entry.
      */
-    return ((double)e->hits + 1.0) * (double)e->tokens / (double)e->file_size;
+    double effective_hits = (double)e->hits;
+    if (half_life_seconds > 0 && now > e->last_used) {
+        double elapsed = (double)(now - e->last_used);
+        effective_hits *= exp2(-elapsed / (double)half_life_seconds);
+    }
+    return (effective_hits + 1.0) * (double)e->tokens / (double)e->file_size;
 }
 
 static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live,
                            const char *protected_sha) {
     if (!kc->enabled || kc->budget_bytes == 0) return;
     kv_cache_refresh(kc);
+    const uint64_t now = (uint64_t)time(NULL);
+    const int half_life = kc->opt.hit_half_life_seconds;
     uint64_t total = 0;
     for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
     if (protected_sha) {
@@ -8731,9 +8751,9 @@ static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live,
     }
     while (total > kc->budget_bytes && kc->len > 0) {
         int victim = 0;
-        double victim_score = kv_entry_eviction_score(&kc->entry[0], live, protected_sha);
+        double victim_score = kv_entry_eviction_score(&kc->entry[0], live, protected_sha, now, half_life);
         for (int i = 1; i < kc->len; i++) {
-            double score = kv_entry_eviction_score(&kc->entry[i], live, protected_sha);
+            double score = kv_entry_eviction_score(&kc->entry[i], live, protected_sha, now, half_life);
             if (score < victim_score ||
                 (score == victim_score && kc->entry[i].last_used < kc->entry[victim].last_used))
             {
@@ -8777,7 +8797,7 @@ static bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb
     kc->opt = opt;
     kv_cache_evict(kc, NULL, NULL);
     server_log(DS4_LOG_KVCACHE,
-               "ds4-server: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d)",
+               "ds4-server: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%ds)",
                kc->dir,
                (unsigned long long)(kc->budget_bytes / (1024ull * 1024ull)),
                reject_different_quant ? "reject" : "accept",
@@ -8785,7 +8805,8 @@ static bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb
                kc->opt.cold_max_tokens,
                kc->opt.continued_interval_tokens,
                kc->opt.boundary_trim_tokens,
-               kc->opt.boundary_align_tokens);
+               kc->opt.boundary_align_tokens,
+               kc->opt.hit_half_life_seconds);
     return true;
 }
 
@@ -11625,6 +11646,9 @@ static void usage(FILE *fp) {
         "      Trim this many tail tokens before cold boundary saves to avoid tokenizer boundary merges. Default: 32\n"
         "  --kv-cache-boundary-align-tokens N\n"
         "      Align cold boundary saves down to this token multiple. 0 disables alignment. Default: 2048\n"
+        "  --kv-cache-hit-half-life-days N\n"
+        "      Halve each entry's hit bonus every N days of inactivity so stale once-popular\n"
+        "      files give way to new prefixes. 0 disables decay. Default: 0\n"
         "  --kv-cache-reject-different-quant\n"
         "      Refuse checkpoints written by the same model with a different routed-expert quantization.\n"
         "  --disable-exact-dsml-tool-replay\n"
@@ -11725,6 +11749,9 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache.boundary_trim_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-boundary-align-tokens")) {
             c.kv_cache.boundary_align_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-cache-hit-half-life-days")) {
+            int days = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.kv_cache.hit_half_life_seconds = days * 86400;
         } else if (!strcmp(arg, "--kv-cache-reject-different-quant")) {
             c.kv_cache_reject_different_quant = true;
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
@@ -14554,6 +14581,30 @@ static void test_kv_cache_eviction_does_not_protect_oversize_current_store(void)
     rmdir(dir);
 }
 
+static void test_kv_cache_eviction_score_decays_stale_hits(void) {
+    /* stale: lower tokens-per-byte (e.g. tool-heavy prompt) but boosted by
+     * 10 hits well in the past.  fresh: higher tokens-per-byte and zero hits,
+     * just stored.  Without decay, stale wins on its hit bonus.  With a
+     * 7-day half-life and 14 half-lives of inactivity, the stale bonus has
+     * shrunk to ~10/16384, and fresh wins on its better baseline. */
+    kv_entry stale = {.tokens = 1024, .hits = 10, .file_size = 4096, .last_used = 0};
+    kv_entry fresh = {.tokens = 2048, .hits = 0,  .file_size = 4096, .last_used = 1000};
+    const uint64_t now = 1000u + 14u * 7u * 86400u;
+
+    double s_off = kv_entry_eviction_score(&stale, NULL, NULL, now, 0);
+    double f_off = kv_entry_eviction_score(&fresh, NULL, NULL, now, 0);
+    TEST_ASSERT(s_off > f_off);
+
+    const int half_life = 7 * 86400;
+    double s_on = kv_entry_eviction_score(&stale, NULL, NULL, now, half_life);
+    double f_on = kv_entry_eviction_score(&fresh, NULL, NULL, now, half_life);
+    TEST_ASSERT(s_on < f_on);
+
+    /* A fresh entry's score never decays below its (0+1) * tokens/size floor,
+     * regardless of how long the half-life is. */
+    TEST_ASSERT(f_on == 1.0 * (double)fresh.tokens / (double)fresh.file_size);
+}
+
 static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     char tmpl[] = "/tmp/ds4-kv-live-prefix-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -14929,6 +14980,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_protects_current_store();
     test_kv_cache_eviction_does_not_protect_oversize_current_store();
+    test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
 }
 
