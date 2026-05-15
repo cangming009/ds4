@@ -4781,15 +4781,15 @@ static void append_openai_usage_json(buf *b, const request *r,
     int cache_write_tokens = r ? r->cache_write_tokens : 0;
     cached_tokens = clamp_usage_tokens(cached_tokens, prompt_tokens);
     cache_write_tokens = clamp_usage_tokens(cache_write_tokens, prompt_tokens - cached_tokens);
-    /* Some OpenAI-compatible consumers normalize cache-write tokens by removing
-     * them from cached_tokens when both fields are present.  Include newly
-     * written tokens here so consumers can recover read and write counts. */
-    int reported_cached_tokens = clamp_usage_tokens(cached_tokens + cache_write_tokens, prompt_tokens);
+    /* OpenAI defines cached_tokens as prompt tokens retrieved from cache.
+     * Newly-prefilled tokens are useful to expose, but they are a DS4 extension
+     * and must stay separate so OpenAI-compatible clients do not over-count
+     * cache hits. */
     buf_printf(b,
                "{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d,"
                "\"prompt_tokens_details\":{\"cached_tokens\":%d,\"cache_write_tokens\":%d}}",
                prompt_tokens, completion_tokens, prompt_tokens + completion_tokens,
-               reported_cached_tokens, cache_write_tokens);
+               cached_tokens, cache_write_tokens);
 }
 
 static bool sse_usage_chunk(int fd, const request *r, const char *id,
@@ -6281,13 +6281,11 @@ static void append_responses_usage_json(buf *b, const request *r,
     int cache_write_tokens = r ? r->cache_write_tokens : 0;
     cached_tokens = clamp_usage_tokens(cached_tokens, input_tokens);
     cache_write_tokens = clamp_usage_tokens(cache_write_tokens, input_tokens - cached_tokens);
-    int reported_cached_tokens = clamp_usage_tokens(cached_tokens + cache_write_tokens,
-                                                    input_tokens);
     buf_printf(b,
         "{\"input_tokens\":%d,\"input_tokens_details\":{\"cached_tokens\":%d,\"cache_write_tokens\":%d},"
         "\"output_tokens\":%d,\"output_tokens_details\":{\"reasoning_tokens\":0},"
         "\"total_tokens\":%d}",
-        input_tokens, reported_cached_tokens, cache_write_tokens,
+        input_tokens, cached_tokens, cache_write_tokens,
         output_tokens, input_tokens + output_tokens);
 }
 
@@ -12585,7 +12583,7 @@ static void test_openai_stream_usage_reports_cache_details(void) {
     TEST_ASSERT(strstr(out, "\"completion_tokens\":2") != NULL);
     TEST_ASSERT(strstr(out, "\"total_tokens\":12") != NULL);
     TEST_ASSERT(strstr(out, "\"prompt_tokens_details\":{") != NULL);
-    TEST_ASSERT(strstr(out, "\"cached_tokens\":10") != NULL);
+    TEST_ASSERT(strstr(out, "\"cached_tokens\":7") != NULL);
     TEST_ASSERT(strstr(out, "\"cache_write_tokens\":3") != NULL);
     TEST_ASSERT(strstr(out, "data: [DONE]") != NULL);
 
@@ -12616,7 +12614,7 @@ static void test_responses_usage_reports_cache_details(void) {
 
     TEST_ASSERT(strstr(out, "\"usage\":{\"input_tokens\":10") != NULL);
     TEST_ASSERT(strstr(out, "\"input_tokens_details\":{") != NULL);
-    TEST_ASSERT(strstr(out, "\"cached_tokens\":10") != NULL);
+    TEST_ASSERT(strstr(out, "\"cached_tokens\":7") != NULL);
     TEST_ASSERT(strstr(out, "\"cache_write_tokens\":3") != NULL);
     TEST_ASSERT(strstr(out, "\"output_tokens\":2") != NULL);
     TEST_ASSERT(strstr(out, "\"total_tokens\":12") != NULL);
@@ -12641,7 +12639,7 @@ static void test_responses_usage_reports_cache_details(void) {
     TEST_ASSERT(strstr(out, "\"type\":\"response.completed\"") != NULL);
     TEST_ASSERT(strstr(out, "\"usage\":{\"input_tokens\":10") != NULL);
     TEST_ASSERT(strstr(out, "\"input_tokens_details\":{") != NULL);
-    TEST_ASSERT(strstr(out, "\"cached_tokens\":10") != NULL);
+    TEST_ASSERT(strstr(out, "\"cached_tokens\":7") != NULL);
     TEST_ASSERT(strstr(out, "\"cache_write_tokens\":3") != NULL);
     TEST_ASSERT(strstr(out, "\"output_tokens\":2") != NULL);
     TEST_ASSERT(strstr(out, "\"total_tokens\":12") != NULL);
