@@ -154,11 +154,19 @@ typedef struct {
     uint16_t qs[QK_K / 8];
 } block_iq2_xxs;
 
+#define QK8_0 32
+
+typedef struct {
+    uint16_t d;
+    int8_t   qs[QK8_0];
+} block_q8_0;
+
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
 DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
+DS4_STATIC_ASSERT(ds4_block_q8_0_size, sizeof(block_q8_0) == 34);
 
 typedef struct {
     uint32_t ctx_size;
@@ -2223,7 +2231,8 @@ static void tensor_expect_plain_layout(
 static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_Q2_K ||
-           type == DS4_TENSOR_Q4_K;
+           type == DS4_TENSOR_Q4_K ||
+           type == DS4_TENSOR_Q8_0;
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
@@ -2231,6 +2240,7 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
+    case DS4_TENSOR_Q8_0:    return sizeof(block_q8_0) * (QK_K / QK8_0);
     default:                 ds4_die("unsupported routed expert tensor type");
     }
     return 0;
@@ -15495,7 +15505,8 @@ int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) return 0;
     const ds4_tensor *gate = e->weights.layer[0].ffn_gate_exps;
     if (!gate) return 0;
-    return gate->type == DS4_TENSOR_Q4_K ? 4 : 2;
+    return gate->type == DS4_TENSOR_Q4_K ? 4 :
+           gate->type == DS4_TENSOR_Q8_0 ? 8 : 2;
 }
 
 bool ds4_engine_has_mtp(ds4_engine *e) {

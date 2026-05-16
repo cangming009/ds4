@@ -5592,7 +5592,7 @@ static bool kv_read_header(FILE *fp, kv_entry *e, uint32_t *text_bytes) {
     if (fread(tb, 1, sizeof(tb), fp) != sizeof(tb)) return false;
     *text_bytes = le_get32(tb);
     e->text_bytes = *text_bytes;
-    return e->tokens != 0 && (e->quant_bits == 2 || e->quant_bits == 4);
+    return e->tokens != 0 && (e->quant_bits == 2 || e->quant_bits == 4 || e->quant_bits == 8);
 }
 
 static bool kv_read_entry_file(const char *path, const char sha[41], kv_entry *out) {
@@ -5949,7 +5949,7 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     tokens_copy_prefix(&store_tokens, tokens, store_len);
 
     const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
-    if (quant_bits != 2 && quant_bits != 4) {
+    if (quant_bits != 2 && quant_bits != 4 && quant_bits != 8) {
         ds4_tokens_free(&store_tokens);
         return false;
     }
@@ -6117,7 +6117,7 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
     kv_disk_cache *kc = &s->kv;
     if (!kc->enabled || !prompt_text) return 0;
     const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
-    if (quant_bits != 2 && quant_bits != 4) return 0;
+    if (quant_bits != 2 && quant_bits != 4 && quant_bits != 8) return 0;
     const size_t prompt_bytes = strlen(prompt_text);
     int idx = kv_cache_find_text_prefix(kc, prompt_text, quant_bits,
                                         ds4_session_ctx(s->session));
